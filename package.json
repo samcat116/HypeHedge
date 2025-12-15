@@ -1,0 +1,18 @@
+{
+  "name": "reactions-kalshi",
+  "version": "1.0.0",
+  "description": "Discord bot that awards currency based on message reactions",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts"
+  },
+  "keywords": ["discord", "bot", "reactions", "currency"],
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
