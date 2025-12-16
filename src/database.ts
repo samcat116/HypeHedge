@@ -103,6 +103,48 @@ export async function getLeaderboard(limit = 10): Promise<LeaderboardEntry[]> {
 	return results.map((r, i) => ({ ...r, rank: i + 1 }));
 }
 
+export interface PaginatedLeaderboard {
+	entries: LeaderboardEntry[];
+	totalCount: number;
+	hasMore: boolean;
+}
+
+export async function getLeaderboardPaginated(
+	page: number,
+	pageSize = 10,
+): Promise<PaginatedLeaderboard> {
+	const offset = page * pageSize;
+
+	const [results, countResult] = await Promise.all([
+		db
+			.select({
+				discord_id: users.discordId,
+				balance: users.balance,
+			})
+			.from(users)
+			.where(gt(users.balance, 0))
+			.orderBy(desc(users.balance))
+			.limit(pageSize)
+			.offset(offset),
+		db
+			.select({ count: sql<number>`count(*)` })
+			.from(users)
+			.where(gt(users.balance, 0)),
+	]);
+
+	const totalCount = Number(countResult[0]?.count ?? 0);
+	const entries = results.map((r, i) => ({
+		...r,
+		rank: offset + i + 1,
+	}));
+
+	return {
+		entries,
+		totalCount,
+		hasMore: offset + entries.length < totalCount,
+	};
+}
+
 // Backfill progress functions
 
 export type BackfillProgressRecord = typeof backfillProgress.$inferSelect;

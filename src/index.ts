@@ -6,6 +6,7 @@ import {
 	Partials,
 } from "discord.js";
 import { commands, registerCommands } from "./commands/index.js";
+import { handleLeaderboardButton } from "./commands/leaderboard.js";
 import { config } from "./config.js";
 import { initDatabase } from "./database.js";
 import * as reactionAdd from "./events/reactionAdd.js";
@@ -30,8 +31,19 @@ initDatabase().catch((err) => {
 client.on(reactionAdd.name, reactionAdd.execute);
 client.on(reactionRemove.name, reactionRemove.execute);
 
-// Handle slash commands
+// Handle interactions
 client.on(Events.InteractionCreate, async (interaction) => {
+	if (interaction.isButton()) {
+		if (interaction.customId.startsWith("leaderboard:")) {
+			try {
+				await handleLeaderboardButton(interaction);
+			} catch (error) {
+				console.error("Error handling leaderboard button:", error);
+			}
+		}
+		return;
+	}
+
 	if (!interaction.isChatInputCommand()) return;
 
 	const command = commands.find(
