@@ -7,6 +7,22 @@ import {
 	unique,
 } from "drizzle-orm/pg-core";
 
+export const markets = pgTable("markets", {
+	id: bigserial("id", { mode: "number" }).primaryKey(),
+	guildId: text("guild_id").notNull(),
+	creatorId: text("creator_id").notNull(),
+	oracleId: text("oracle_id").notNull(),
+	description: text("description").notNull(),
+	outcomeType: text("outcome_type").notNull(), // "binary" | "multi"
+	options: text("options").array(), // null for binary, ["Option A", "Option B", ...] for multi
+	status: text("status").notNull().default("open"), // "open" | "resolved"
+	resolution: text("resolution"), // null until resolved
+	createdAt: timestamp("created_at", { withTimezone: true })
+		.notNull()
+		.defaultNow(),
+	resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+});
+
 export const backfillProgress = pgTable(
 	"backfill_progress",
 	{
