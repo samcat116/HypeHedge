@@ -9,6 +9,10 @@ import {
 	SlashCommandBuilder,
 } from "discord.js";
 import { getLeaderboardPaginated } from "../database.js";
+import {
+	leaderboardPageViewsCounter,
+	leaderboardQueryDuration,
+} from "../telemetry/metrics.js";
 
 const PAGE_SIZE = 10;
 
@@ -57,7 +61,11 @@ function buildPaginationButtons(
 export async function execute(
 	interaction: ChatInputCommandInteraction,
 ): Promise<void> {
+	const startTime = performance.now();
 	const { entries, totalCount, hasMore } = await getLeaderboardPaginated(0);
+	leaderboardQueryDuration.record(performance.now() - startTime, { page: "0" });
+
+	leaderboardPageViewsCounter.add(1, { page: "0", source: "command" });
 
 	if (entries.length === 0) {
 		await interaction.reply({
@@ -84,8 +92,17 @@ export async function handleLeaderboardButton(
 	const currentPage = Number.parseInt(pageStr, 10);
 	const newPage = action === "next" ? currentPage + 1 : currentPage - 1;
 
+	const startTime = performance.now();
 	const { entries, totalCount, hasMore } =
 		await getLeaderboardPaginated(newPage);
+	leaderboardQueryDuration.record(performance.now() - startTime, {
+		page: String(newPage),
+	});
+
+	leaderboardPageViewsCounter.add(1, {
+		page: String(newPage),
+		source: "button",
+	});
 
 	const embed = buildLeaderboardEmbed(entries, newPage, totalCount);
 	const buttons = buildPaginationButtons(newPage, hasMore);

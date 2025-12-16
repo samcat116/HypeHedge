@@ -16,6 +16,13 @@ import {
 	resetStaleProgress,
 	updateChannelProgress,
 } from "../database.js";
+import { withSpan } from "../telemetry/index.js";
+import { logger } from "../telemetry/logger.js";
+import {
+	backfillBatchCounter,
+	backfillBatchDuration,
+	meter,
+} from "../telemetry/metrics.js";
 
 export const data = new SlashCommandBuilder()
 	.setName("backfill")
@@ -98,118 +105,182 @@ async function processChannel(
 	progress: ProgressState,
 	updateProgress: () => void,
 ): Promise<ChannelResult> {
-	const result: ChannelResult = {
-		channelId: textChannel.id,
-		channelName: textChannel.name,
-		messagesProcessed: 0,
-		reactionsAdded: 0,
-		status: "completed",
-	};
+	return withSpan(
+		"backfill.channel",
+		{
+			"backfill.channel_id": textChannel.id,
+			"backfill.channel_name": textChannel.name,
+			"backfill.guild_id": guildId,
+		},
+		async (channelSpan) => {
+			const result: ChannelResult = {
+				channelId: textChannel.id,
+				channelName: textChannel.name,
+				messagesProcessed: 0,
+				reactionsAdded: 0,
+				status: "completed",
+			};
 
-	try {
-		// Get or create progress record
-		const channelProgress = await getOrCreateChannelProgress(
-			guildId,
-			textChannel.id,
-		);
-
-		// Skip if already completed
-		if (channelProgress.status === "completed") {
-			result.messagesProcessed = channelProgress.messagesProcessed;
-			result.reactionsAdded = channelProgress.reactionsAdded;
-			result.status = "skipped";
-			return result;
-		}
-
-		// Resume from last checkpoint
-		let lastMessageId: string | undefined =
-			channelProgress.lastMessageId ?? undefined;
-		let channelMessages = channelProgress.messagesProcessed;
-		let channelReactions = channelProgress.reactionsAdded;
-
-		progress.channelsInProgress.add(textChannel.name);
-		updateProgress();
-
-		while (true) {
-			if (limit !== null && channelMessages >= limit) break;
-
-			const fetchLimit =
-				limit !== null ? Math.min(100, limit - channelMessages) : 100;
-			const messages = await textChannel.messages.fetch({
-				limit: fetchLimit,
-				...(lastMessageId && { before: lastMessageId }),
-			});
-
-			if (messages.size === 0) break;
-
-			// Collect reactions for batch insert
-			const reactionBatch: ReactionBatchItem[] = [];
-
-			for (const [, message] of messages) {
-				if (message.author.bot) continue;
-
-				for (const [, reaction] of message.reactions.cache) {
-					const emoji = reaction.emoji.id ?? reaction.emoji.name ?? "unknown";
-
-					try {
-						const users = await reaction.users.fetch();
-
-						for (const [, user] of users) {
-							if (user.id === message.author.id) continue; // Skip self-reactions
-							if (user.bot) continue;
-
-							reactionBatch.push({
-								messageId: message.id,
-								reactorId: user.id,
-								authorId: message.author.id,
-								emoji,
-							});
-						}
-					} catch {
-						// Reaction may have been removed, continue
-					}
-				}
-
-				channelMessages++;
-			}
-
-			// Batch insert reactions
-			const added = await addReactionsBatch(reactionBatch);
-			channelReactions += added;
-
-			lastMessageId = messages.last()?.id;
-
-			// Update checkpoint after each batch
-			if (lastMessageId) {
-				await updateChannelProgress(
+			try {
+				// Get or create progress record
+				const channelProgress = await getOrCreateChannelProgress(
 					guildId,
 					textChannel.id,
-					lastMessageId,
-					messages.size,
-					added,
 				);
+
+				// Skip if already completed
+				if (channelProgress.status === "completed") {
+					result.messagesProcessed = channelProgress.messagesProcessed;
+					result.reactionsAdded = channelProgress.reactionsAdded;
+					result.status = "skipped";
+					channelSpan.addEvent("channel_skipped", {
+						reason: "already_completed",
+					});
+					return result;
+				}
+
+				// Resume from last checkpoint
+				let lastMessageId: string | undefined =
+					channelProgress.lastMessageId ?? undefined;
+				let channelMessages = channelProgress.messagesProcessed;
+				let channelReactions = channelProgress.reactionsAdded;
+
+				progress.channelsInProgress.add(textChannel.name);
+				updateProgress();
+
+				while (true) {
+					if (limit !== null && channelMessages >= limit) break;
+
+					const fetchLimit =
+						limit !== null ? Math.min(100, limit - channelMessages) : 100;
+
+					const batchStartTime = performance.now();
+
+					// Each batch gets its own span (short-lived)
+					const batchResult = await withSpan(
+						"backfill.batch",
+						{
+							"backfill.batch_size": fetchLimit,
+							"backfill.channel_id": textChannel.id,
+						},
+						async (batchSpan) => {
+							const messages = await textChannel.messages.fetch({
+								limit: fetchLimit,
+								...(lastMessageId && { before: lastMessageId }),
+							});
+
+							if (messages.size === 0) {
+								batchSpan.addEvent("no_more_messages");
+								return { done: true, messagesCount: 0, reactionsCount: 0 };
+							}
+
+							// Collect reactions for batch insert
+							const reactionBatch: ReactionBatchItem[] = [];
+
+							for (const [, message] of messages) {
+								if (message.author.bot) continue;
+
+								for (const [, reaction] of message.reactions.cache) {
+									const emoji =
+										reaction.emoji.id ?? reaction.emoji.name ?? "unknown";
+
+									try {
+										const users = await reaction.users.fetch();
+
+										for (const [, user] of users) {
+											if (user.id === message.author.id) continue; // Skip self-reactions
+											if (user.bot) continue;
+
+											reactionBatch.push({
+												messageId: message.id,
+												reactorId: user.id,
+												authorId: message.author.id,
+												emoji,
+											});
+										}
+									} catch {
+										// Reaction may have been removed, continue
+									}
+								}
+
+								channelMessages++;
+							}
+
+							// Batch insert reactions
+							const added = await addReactionsBatch(reactionBatch);
+							channelReactions += added;
+
+							lastMessageId = messages.last()?.id;
+
+							// Update checkpoint after each batch
+							if (lastMessageId) {
+								await updateChannelProgress(
+									guildId,
+									textChannel.id,
+									lastMessageId,
+									messages.size,
+									added,
+								);
+							}
+
+							batchSpan.setAttributes({
+								"backfill.messages_in_batch": messages.size,
+								"backfill.reactions_added": added,
+							});
+
+							return {
+								done: false,
+								messagesCount: messages.size,
+								reactionsCount: added,
+							};
+						},
+					);
+
+					const batchDuration = performance.now() - batchStartTime;
+					backfillBatchDuration.record(batchDuration, {
+						channel_id: textChannel.id,
+					});
+					backfillBatchCounter.add(1, { channel_id: textChannel.id });
+
+					if (batchResult.done) break;
+
+					// Update shared progress state
+					progress.totalMessages += batchResult.messagesCount;
+					progress.totalReactions += batchResult.reactionsCount;
+					updateProgress();
+
+					// Record span event for progress
+					channelSpan.addEvent("batch_completed", {
+						messages_processed: channelMessages,
+						reactions_added: channelReactions,
+					});
+				}
+
+				// Mark channel as completed
+				await markChannelCompleted(guildId, textChannel.id);
+
+				result.messagesProcessed = channelMessages;
+				result.reactionsAdded = channelReactions;
+
+				channelSpan.setAttributes({
+					"backfill.total_messages": channelMessages,
+					"backfill.total_reactions": channelReactions,
+				});
+			} catch (error) {
+				result.status = "error";
+				result.error = error instanceof Error ? error.message : String(error);
+				logger.error(`Error processing channel ${textChannel.name}`, {
+					channelId: textChannel.id,
+					error: result.error,
+				});
+				throw error;
+			} finally {
+				progress.channelsInProgress.delete(textChannel.name);
 			}
 
-			// Update shared progress state
-			progress.totalMessages += messages.size;
-			progress.totalReactions += added;
-			updateProgress();
-		}
-
-		// Mark channel as completed
-		await markChannelCompleted(guildId, textChannel.id);
-
-		result.messagesProcessed = channelMessages;
-		result.reactionsAdded = channelReactions;
-	} catch (error) {
-		result.status = "error";
-		result.error = error instanceof Error ? error.message : String(error);
-		console.error(`Error processing channel ${textChannel.name}:`, error);
-	} finally {
-		progress.channelsInProgress.delete(textChannel.name);
-	}
-
-	return result;
+			return result;
+		},
+	);
 }
 
 export async function execute(
@@ -229,6 +300,13 @@ export async function execute(
 
 	const guild = interaction.guild;
 	const guildId = guild.id;
+
+	logger.info("Starting backfill", {
+		guildId,
+		limit,
+		reset,
+		concurrency,
+	});
 
 	// Handle reset flag
 	if (reset) {
@@ -297,11 +375,46 @@ export async function execute(
 		channelsInProgress: new Set(),
 	};
 
+	// Register observable gauges for real-time progress
+	// Note: These gauges are created per-backfill run and observe current progress state
+	// The callbacks remain active but will just report final values after completion
+	const channelsGauge = meter.createObservableGauge(
+		"backfill.channels.completed",
+		{
+			description: "Number of channels completed in current backfill",
+			unit: "1",
+		},
+	);
+	const messagesGauge = meter.createObservableGauge(
+		"backfill.messages.processed",
+		{
+			description: "Number of messages processed in current backfill",
+			unit: "1",
+		},
+	);
+	const reactionsGauge = meter.createObservableGauge(
+		"backfill.reactions.added",
+		{
+			description: "Number of reactions added in current backfill",
+			unit: "1",
+		},
+	);
+
+	channelsGauge.addCallback((result) => {
+		result.observe(progress.channelsCompleted, { guild_id: guildId });
+	});
+	messagesGauge.addCallback((result) => {
+		result.observe(progress.totalMessages, { guild_id: guildId });
+	});
+	reactionsGauge.addCallback((result) => {
+		result.observe(progress.totalReactions, { guild_id: guildId });
+	});
+
 	// Debounced progress updates
 	let lastUpdate = 0;
 	const UPDATE_INTERVAL = 5000; // 5 seconds
 
-	const updateProgress = async () => {
+	const updateProgressFn = async () => {
 		const now = Date.now();
 		if (now - lastUpdate < UPDATE_INTERVAL) return;
 		lastUpdate = now;
@@ -332,14 +445,24 @@ export async function execute(
 				guildId,
 				limit,
 				progress,
-				updateProgress,
+				updateProgressFn,
 			);
 			if (result.status !== "skipped") {
 				progress.channelsCompleted++;
 			}
 			results.push(result);
-			updateProgress();
+			updateProgressFn();
 			return result;
+		} catch (error) {
+			// Error already logged in processChannel, just collect the result
+			results.push({
+				channelId: channel.id,
+				channelName: channel.name,
+				messagesProcessed: 0,
+				reactionsAdded: 0,
+				status: "error",
+				error: error instanceof Error ? error.message : String(error),
+			});
 		} finally {
 			semaphore.release();
 		}
@@ -355,6 +478,14 @@ export async function execute(
 					.map((e) => `- #${e.channelName}: ${e.error}`)
 					.join("\n")}`
 			: "";
+
+	logger.info("Backfill complete", {
+		guildId,
+		channelsScanned: progress.channelsCompleted,
+		messagesScanned: progress.totalMessages,
+		reactionsAdded: progress.totalReactions,
+		errorCount: errors.length,
+	});
 
 	await interaction.editReply({
 		content: `Backfill complete!\n- Channels scanned: ${progress.channelsCompleted}\n- Messages scanned: ${progress.totalMessages.toLocaleString()}\n- Reactions added: ${progress.totalReactions.toLocaleString()}${errorText}`,

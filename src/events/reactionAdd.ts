@@ -6,6 +6,14 @@ import {
 	type User,
 } from "discord.js";
 import { addReaction } from "../database.js";
+import { withSpan } from "../telemetry/index.js";
+import { logger } from "../telemetry/logger.js";
+import {
+	botReactionsSkippedCounter,
+	reactionProcessingDuration,
+	reactionsAddedCounter,
+	selfReactionsSkippedCounter,
+} from "../telemetry/metrics.js";
 
 export const name = Events.MessageReactionAdd;
 
@@ -13,41 +21,88 @@ export async function execute(
 	reaction: MessageReaction | PartialMessageReaction,
 	user: User | PartialUser,
 ): Promise<void> {
+	const startTime = performance.now();
+
 	try {
-		// Fetch partial reaction if needed
-		const fullReaction = reaction.partial ? await reaction.fetch() : reaction;
+		await withSpan(
+			"reaction.add",
+			{
+				"discord.event": "MessageReactionAdd",
+				"discord.guild_id": reaction.message.guildId ?? "dm",
+				"discord.channel_id": reaction.message.channelId,
+			},
+			async (span) => {
+				// Fetch partial reaction if needed
+				const fullReaction = reaction.partial
+					? await reaction.fetch()
+					: reaction;
 
-		// Fetch partial user if needed
-		const fullUser = user.partial ? await user.fetch() : user;
+				// Fetch partial user if needed
+				const fullUser = user.partial ? await user.fetch() : user;
 
-		const message = fullReaction.message;
+				const message = fullReaction.message;
 
-		// Fetch message if partial to get author
-		if (message.partial) {
-			await message.fetch();
-		}
+				// Fetch message if partial to get author
+				if (message.partial) {
+					await message.fetch();
+				}
 
-		const authorId = message.author?.id;
+				const authorId = message.author?.id;
+				const emoji =
+					fullReaction.emoji.id ?? fullReaction.emoji.name ?? "unknown";
 
-		// Skip if no author (shouldn't happen, but be safe)
-		if (!authorId) {
-			return;
-		}
+				span.setAttributes({
+					"discord.message_id": message.id,
+					"discord.reactor_id": fullUser.id,
+					"discord.emoji": emoji,
+				});
 
-		// Skip self-reactions
-		if (fullUser.id === authorId) {
-			return;
-		}
+				// Skip if no author (shouldn't happen, but be safe)
+				if (!authorId) {
+					span.addEvent("skipped", { reason: "no_author" });
+					return;
+				}
 
-		// Skip bot messages
-		if (message.author?.bot) {
-			return;
-		}
+				span.setAttribute("discord.author_id", authorId);
 
-		const emoji = fullReaction.emoji.id ?? fullReaction.emoji.name ?? "unknown";
+				// Skip self-reactions
+				if (fullUser.id === authorId) {
+					selfReactionsSkippedCounter.add(1, { emoji });
+					span.addEvent("skipped", { reason: "self_reaction" });
+					return;
+				}
 
-		await addReaction(message.id, fullUser.id, authorId, emoji);
+				// Skip bot messages
+				if (message.author?.bot) {
+					botReactionsSkippedCounter.add(1, { emoji });
+					span.addEvent("skipped", { reason: "bot_message" });
+					return;
+				}
+
+				const added = await addReaction(
+					message.id,
+					fullUser.id,
+					authorId,
+					emoji,
+				);
+
+				if (added) {
+					reactionsAddedCounter.add(1, {
+						emoji,
+						guild_id: reaction.message.guildId ?? "dm",
+					});
+					span.addEvent("reaction_recorded");
+				} else {
+					span.addEvent("duplicate_reaction");
+				}
+			},
+		);
 	} catch (error) {
-		console.error("Error handling reaction add:", error);
+		logger.error("Error handling reaction add", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	} finally {
+		const duration = performance.now() - startTime;
+		reactionProcessingDuration.record(duration, { event: "add" });
 	}
 }

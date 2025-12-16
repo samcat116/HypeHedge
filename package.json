@@ -13,6 +13,16 @@
 	"keywords": ["discord", "bot", "reactions", "currency"],
 	"license": "MIT",
 	"dependencies": {
+		"@opentelemetry/api": "^1.9.0",
+		"@opentelemetry/exporter-logs-otlp-http": "^0.57.0",
+		"@opentelemetry/exporter-metrics-otlp-http": "^0.57.0",
+		"@opentelemetry/exporter-trace-otlp-http": "^0.57.0",
+		"@opentelemetry/resources": "^1.29.0",
+		"@opentelemetry/sdk-logs": "^0.57.0",
+		"@opentelemetry/sdk-metrics": "^1.29.0",
+		"@opentelemetry/sdk-node": "^0.57.0",
+		"@opentelemetry/sdk-trace-base": "^1.29.0",
+		"@opentelemetry/semantic-conventions": "^1.28.0",
 		"discord.js": "^14.16.3",
 		"drizzle-orm": "^0.45.1",
 		"postgres": "^3.4.7"
