@@ -44,7 +44,7 @@ export async function execute(
 
     const emoji = reaction.emoji.id ?? reaction.emoji.name ?? "unknown";
 
-    addReaction(message.id, user.id, authorId, emoji);
+    await addReaction(message.id, user.id, authorId, emoji);
   } catch (error) {
     console.error("Error handling reaction add:", error);
   }

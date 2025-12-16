@@ -15,7 +15,7 @@ export async function execute(
 
     const emoji = reaction.emoji.id ?? reaction.emoji.name ?? "unknown";
 
-    removeReaction(reaction.message.id, user.id, emoji);
+    await removeReaction(reaction.message.id, user.id, emoji);
   } catch (error) {
     console.error("Error handling reaction remove:", error);
   }

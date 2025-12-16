@@ -1,4 +1,4 @@
-import { ChatInputCommandInteraction, SlashCommandBuilder } from "discord.js";
+import { ChatInputCommandInteraction, SlashCommandBuilder, MessageFlags } from "discord.js";
 import { getLeaderboard } from "../database.js";
 
 export const data = new SlashCommandBuilder()
@@ -8,12 +8,12 @@ export const data = new SlashCommandBuilder()
 export async function execute(
   interaction: ChatInputCommandInteraction
 ): Promise<void> {
-  const entries = getLeaderboard(10);
+  const entries = await getLeaderboard(10);
 
   if (entries.length === 0) {
     await interaction.reply({
       content: "No one has earned any coins yet!",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -31,6 +31,5 @@ export async function execute(
 
   await interaction.reply({
     content: `**Leaderboard**\n\n${lines.join("\n")}`,
-    ephemeral: false,
   });
 }

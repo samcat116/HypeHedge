@@ -4,6 +4,7 @@ import {
   Partials,
   Events,
   ChatInputCommandInteraction,
+  MessageFlags,
 } from "discord.js";
 import { config } from "./config.js";
 import { initDatabase } from "./database.js";
@@ -21,7 +22,10 @@ const client = new Client({
 });
 
 // Initialize database
-initDatabase();
+initDatabase().catch((err) => {
+  console.error("Failed to initialize database:", err);
+  process.exit(1);
+});
 
 // Register event handlers
 client.on(reactionAdd.name, reactionAdd.execute);
@@ -47,7 +51,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     const reply = {
       content: "There was an error executing this command.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     };
 
     if (interaction.replied || interaction.deferred) {

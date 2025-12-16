@@ -1,95 +1,86 @@
-import { Database } from "bun:sqlite";
-import path from "path";
+import { eq, and, desc, gt, lt, sql } from "drizzle-orm";
+import { db } from "./db";
+import { users, reactions, backfillProgress } from "./db/schema";
 
-const dbPath = path.join(import.meta.dir, "..", "data.db");
-const db = new Database(dbPath);
-
-export function initDatabase(): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      discord_id TEXT PRIMARY KEY,
-      balance INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS reactions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      message_id TEXT NOT NULL,
-      reactor_id TEXT NOT NULL,
-      author_id TEXT NOT NULL,
-      emoji TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(message_id, reactor_id, emoji)
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_reactions_author ON reactions(author_id);
-  `);
+export async function initDatabase(): Promise<void> {
+  // Schema managed by drizzle-kit, just verify connection
+  await db.select().from(users).limit(1);
+  console.log("Connected to database");
 }
 
-export function addReaction(
+export async function addReaction(
   messageId: string,
   reactorId: string,
   authorId: string,
   emoji: string
-): boolean {
-  const insertReaction = db.prepare(`
-    INSERT OR IGNORE INTO reactions (message_id, reactor_id, author_id, emoji)
-    VALUES (?, ?, ?, ?)
-  `);
+): Promise<boolean> {
+  // Insert reaction, ignore if duplicate
+  const result = await db
+    .insert(reactions)
+    .values({ messageId, reactorId, authorId, emoji })
+    .onConflictDoNothing()
+    .returning();
 
-  const upsertUser = db.prepare(`
-    INSERT INTO users (discord_id, balance)
-    VALUES (?, 1)
-    ON CONFLICT(discord_id) DO UPDATE SET balance = balance + 1
-  `);
-
-  const result = insertReaction.run(messageId, reactorId, authorId, emoji);
-
-  if (result.changes > 0) {
-    upsertUser.run(authorId);
+  if (result.length > 0) {
+    // Upsert user balance
+    await db
+      .insert(users)
+      .values({ discordId: authorId, balance: 1 })
+      .onConflictDoUpdate({
+        target: users.discordId,
+        set: { balance: sql`${users.balance} + 1` },
+      });
     return true;
   }
-
   return false;
 }
 
-export function removeReaction(
+export async function removeReaction(
   messageId: string,
   reactorId: string,
   emoji: string
-): boolean {
-  const getReaction = db.prepare(`
-    SELECT author_id FROM reactions
-    WHERE message_id = ? AND reactor_id = ? AND emoji = ?
-  `);
+): Promise<boolean> {
+  // Get reaction to find author
+  const [reaction] = await db
+    .select({ authorId: reactions.authorId })
+    .from(reactions)
+    .where(
+      and(
+        eq(reactions.messageId, messageId),
+        eq(reactions.reactorId, reactorId),
+        eq(reactions.emoji, emoji)
+      )
+    );
 
-  const deleteReaction = db.prepare(`
-    DELETE FROM reactions
-    WHERE message_id = ? AND reactor_id = ? AND emoji = ?
-  `);
+  if (!reaction) return false;
 
-  const decrementBalance = db.prepare(`
-    UPDATE users SET balance = balance - 1
-    WHERE discord_id = ? AND balance > 0
-  `);
+  // Delete reaction
+  await db
+    .delete(reactions)
+    .where(
+      and(
+        eq(reactions.messageId, messageId),
+        eq(reactions.reactorId, reactorId),
+        eq(reactions.emoji, emoji)
+      )
+    );
 
-  const reaction = getReaction.get(messageId, reactorId, emoji) as
-    | { author_id: string }
-    | undefined;
+  // Decrement balance
+  await db
+    .update(users)
+    .set({ balance: sql`${users.balance} - 1` })
+    .where(and(eq(users.discordId, reaction.authorId), gt(users.balance, 0)));
 
-  if (reaction) {
-    deleteReaction.run(messageId, reactorId, emoji);
-    decrementBalance.run(reaction.author_id);
-    return true;
-  }
-
-  return false;
+  return true;
 }
 
-export function getBalance(userId: string): number {
-  const stmt = db.prepare(`SELECT balance FROM users WHERE discord_id = ?`);
-  const result = stmt.get(userId) as { balance: number } | undefined;
-  return result?.balance ?? 0;
+export async function getBalance(userId: string): Promise<number> {
+  const [user] = await db
+    .select({ balance: users.balance })
+    .from(users)
+    .where(eq(users.discordId, userId));
+
+  return user?.balance ?? 0;
 }
 
 export interface LeaderboardEntry {
@@ -98,15 +89,156 @@ export interface LeaderboardEntry {
   rank: number;
 }
 
-export function getLeaderboard(limit: number = 10): LeaderboardEntry[] {
-  const stmt = db.prepare(`
-    SELECT discord_id, balance,
-           ROW_NUMBER() OVER (ORDER BY balance DESC) as rank
-    FROM users
-    WHERE balance > 0
-    ORDER BY balance DESC
-    LIMIT ?
-  `);
+export async function getLeaderboard(limit: number = 10): Promise<LeaderboardEntry[]> {
+  const results = await db
+    .select({
+      discord_id: users.discordId,
+      balance: users.balance,
+    })
+    .from(users)
+    .where(gt(users.balance, 0))
+    .orderBy(desc(users.balance))
+    .limit(limit);
 
-  return stmt.all(limit) as LeaderboardEntry[];
+  return results.map((r, i) => ({ ...r, rank: i + 1 }));
+}
+
+// Backfill progress functions
+
+export type BackfillProgressRecord = typeof backfillProgress.$inferSelect;
+
+export async function getOrCreateChannelProgress(
+  guildId: string,
+  channelId: string
+): Promise<BackfillProgressRecord> {
+  const [existing] = await db
+    .select()
+    .from(backfillProgress)
+    .where(
+      and(
+        eq(backfillProgress.guildId, guildId),
+        eq(backfillProgress.channelId, channelId)
+      )
+    );
+
+  if (existing) return existing;
+
+  const [created] = await db
+    .insert(backfillProgress)
+    .values({ guildId, channelId, status: "pending" })
+    .returning();
+
+  return created;
+}
+
+export async function updateChannelProgress(
+  guildId: string,
+  channelId: string,
+  lastMessageId: string,
+  messagesIncrement: number,
+  reactionsIncrement: number
+): Promise<void> {
+  await db
+    .update(backfillProgress)
+    .set({
+      lastMessageId,
+      messagesProcessed: sql`${backfillProgress.messagesProcessed} + ${messagesIncrement}`,
+      reactionsAdded: sql`${backfillProgress.reactionsAdded} + ${reactionsIncrement}`,
+      status: "in_progress",
+      updatedAt: sql`now()`,
+    })
+    .where(
+      and(
+        eq(backfillProgress.guildId, guildId),
+        eq(backfillProgress.channelId, channelId)
+      )
+    );
+}
+
+export async function markChannelCompleted(
+  guildId: string,
+  channelId: string
+): Promise<void> {
+  await db
+    .update(backfillProgress)
+    .set({
+      status: "completed",
+      updatedAt: sql`now()`,
+    })
+    .where(
+      and(
+        eq(backfillProgress.guildId, guildId),
+        eq(backfillProgress.channelId, channelId)
+      )
+    );
+}
+
+export async function getGuildBackfillProgress(
+  guildId: string
+): Promise<BackfillProgressRecord[]> {
+  return db
+    .select()
+    .from(backfillProgress)
+    .where(eq(backfillProgress.guildId, guildId));
+}
+
+export async function resetStaleProgress(guildId: string): Promise<void> {
+  const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+  await db
+    .update(backfillProgress)
+    .set({ status: "pending", updatedAt: sql`now()` })
+    .where(
+      and(
+        eq(backfillProgress.guildId, guildId),
+        eq(backfillProgress.status, "in_progress"),
+        lt(backfillProgress.updatedAt, oneHourAgo)
+      )
+    );
+}
+
+export async function resetGuildBackfillProgress(guildId: string): Promise<void> {
+  await db
+    .delete(backfillProgress)
+    .where(eq(backfillProgress.guildId, guildId));
+}
+
+export interface ReactionBatchItem {
+  messageId: string;
+  reactorId: string;
+  authorId: string;
+  emoji: string;
+}
+
+export async function addReactionsBatch(
+  reactionBatch: ReactionBatchItem[]
+): Promise<number> {
+  if (reactionBatch.length === 0) return 0;
+
+  // Insert all reactions, ignoring duplicates
+  const inserted = await db
+    .insert(reactions)
+    .values(reactionBatch)
+    .onConflictDoNothing()
+    .returning({ authorId: reactions.authorId });
+
+  if (inserted.length === 0) return 0;
+
+  // Count reactions per author for balance updates
+  const authorCounts = new Map<string, number>();
+  for (const { authorId } of inserted) {
+    authorCounts.set(authorId, (authorCounts.get(authorId) ?? 0) + 1);
+  }
+
+  // Batch update balances
+  for (const [authorId, count] of authorCounts) {
+    await db
+      .insert(users)
+      .values({ discordId: authorId, balance: count })
+      .onConflictDoUpdate({
+        target: users.discordId,
+        set: { balance: sql`${users.balance} + ${count}` },
+      });
+  }
+
+  return inserted.length;
 }

@@ -1,4 +1,4 @@
-import { ChatInputCommandInteraction, SlashCommandBuilder } from "discord.js";
+import { ChatInputCommandInteraction, SlashCommandBuilder, MessageFlags } from "discord.js";
 import { getBalance } from "../database.js";
 
 export const data = new SlashCommandBuilder()
@@ -15,17 +15,17 @@ export async function execute(
   interaction: ChatInputCommandInteraction
 ): Promise<void> {
   const targetUser = interaction.options.getUser("user") ?? interaction.user;
-  const balance = getBalance(targetUser.id);
+  const balance = await getBalance(targetUser.id);
 
   if (targetUser.id === interaction.user.id) {
     await interaction.reply({
       content: `You have **${balance}** coins.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   } else {
     await interaction.reply({
       content: `${targetUser.displayName} has **${balance}** coins.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 }

@@ -9,4 +9,5 @@ function getEnvVar(name: string): string {
 export const config = {
   botToken: getEnvVar("BOT_TOKEN"),
   clientId: getEnvVar("CLIENT_ID"),
+  databaseUrl: getEnvVar("DATABASE_URL"),
 };
