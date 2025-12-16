@@ -1,6 +1,6 @@
 import { and, desc, eq, gt, lt, sql } from "drizzle-orm";
 import { db } from "./db";
-import { backfillProgress, reactions, users } from "./db/schema";
+import { backfillProgress, markets, reactions, users } from "./db/schema";
 import { withSpan } from "./telemetry/index.js";
 import { logger } from "./telemetry/logger.js";
 import {
@@ -359,5 +359,64 @@ export async function addReactionsBatch(
 		});
 
 		return inserted.length;
+	});
+}
+
+// Market functions
+
+export type MarketRecord = typeof markets.$inferSelect;
+
+export interface CreateMarketParams {
+	guildId: string;
+	creatorId: string;
+	oracleId: string;
+	description: string;
+	outcomeType: "binary" | "multi";
+	options?: string[];
+}
+
+export async function createMarket(
+	params: CreateMarketParams,
+): Promise<MarketRecord> {
+	return withDbSpan("insert", "markets", async () => {
+		const [market] = await db
+			.insert(markets)
+			.values({
+				guildId: params.guildId,
+				creatorId: params.creatorId,
+				oracleId: params.oracleId,
+				description: params.description,
+				outcomeType: params.outcomeType,
+				options: params.options ?? null,
+			})
+			.returning();
+
+		return market;
+	});
+}
+
+export async function getMarket(id: number): Promise<MarketRecord | null> {
+	return withDbSpan("select", "markets", async () => {
+		const [market] = await db.select().from(markets).where(eq(markets.id, id));
+
+		return market ?? null;
+	});
+}
+
+export async function getGuildMarkets(
+	guildId: string,
+	status?: "open" | "resolved",
+): Promise<MarketRecord[]> {
+	return withDbSpan("select", "markets", async () => {
+		const conditions = [eq(markets.guildId, guildId)];
+		if (status) {
+			conditions.push(eq(markets.status, status));
+		}
+
+		return db
+			.select()
+			.from(markets)
+			.where(and(...conditions))
+			.orderBy(desc(markets.createdAt));
 	});
 }

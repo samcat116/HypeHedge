@@ -8,6 +8,13 @@
       "when": 1765846595759,
       "tag": "0000_wild_queen_noir",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1765858685609,
+      "tag": "0001_chunky_maelstrom",
+      "breakpoints": true
     }
   ]
 }

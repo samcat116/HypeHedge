@@ -10,8 +10,9 @@ import {
 import * as backfill from "./backfill.js";
 import * as balance from "./balance.js";
 import * as leaderboard from "./leaderboard.js";
+import * as market from "./market.js";
 
-export const commands = [balance, leaderboard, backfill];
+export const commands = [balance, leaderboard, backfill, market];
 
 const commandData = commands.map((cmd) => cmd.data.toJSON());
 

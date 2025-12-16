@@ -14,6 +14,7 @@ import {
 	registerCommands,
 } from "./commands/index.js";
 import { handleLeaderboardButton } from "./commands/leaderboard.js";
+import { handleMarketModalSubmit } from "./commands/market.js";
 import { config } from "./config.js";
 import { initDatabase } from "./database.js";
 import * as reactionAdd from "./events/reactionAdd.js";
@@ -44,6 +45,26 @@ client.on(reactionRemove.name, reactionRemove.execute);
 
 // Handle interactions
 client.on(Events.InteractionCreate, async (interaction) => {
+	// Modal submissions
+	if (interaction.isModalSubmit()) {
+		if (interaction.customId.startsWith("market:")) {
+			await withSpan(
+				"modal.market",
+				{
+					"discord.interaction_type": "modal_submit",
+					"discord.custom_id": interaction.customId,
+					"discord.user_id": interaction.user.id,
+					"discord.guild_id": interaction.guildId ?? "dm",
+				},
+				async () => {
+					await handleMarketModalSubmit(interaction);
+				},
+			);
+		}
+		return;
+	}
+
+	// Button interactions
 	if (interaction.isButton()) {
 		if (interaction.customId.startsWith("leaderboard:")) {
 			await withSpan(
