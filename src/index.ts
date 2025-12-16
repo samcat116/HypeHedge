@@ -1,3 +1,6 @@
+// Must be first import to initialize OpenTelemetry SDK
+import "./instrumentation.js";
+
 import {
 	type ChatInputCommandInteraction,
 	Client,
@@ -5,12 +8,18 @@ import {
 	GatewayIntentBits,
 	Partials,
 } from "discord.js";
-import { commands, registerCommands } from "./commands/index.js";
+import {
+	commands,
+	executeWithTelemetry,
+	registerCommands,
+} from "./commands/index.js";
 import { handleLeaderboardButton } from "./commands/leaderboard.js";
 import { config } from "./config.js";
 import { initDatabase } from "./database.js";
 import * as reactionAdd from "./events/reactionAdd.js";
 import * as reactionRemove from "./events/reactionRemove.js";
+import { withSpan } from "./telemetry/index.js";
+import { logger } from "./telemetry/logger.js";
 
 const client = new Client({
 	intents: [
@@ -23,7 +32,9 @@ const client = new Client({
 
 // Initialize database
 initDatabase().catch((err) => {
-	console.error("Failed to initialize database:", err);
+	logger.error("Failed to initialize database", {
+		error: err instanceof Error ? err.message : String(err),
+	});
 	process.exit(1);
 });
 
@@ -35,11 +46,18 @@ client.on(reactionRemove.name, reactionRemove.execute);
 client.on(Events.InteractionCreate, async (interaction) => {
 	if (interaction.isButton()) {
 		if (interaction.customId.startsWith("leaderboard:")) {
-			try {
-				await handleLeaderboardButton(interaction);
-			} catch (error) {
-				console.error("Error handling leaderboard button:", error);
-			}
+			await withSpan(
+				"button.leaderboard",
+				{
+					"discord.interaction_type": "button",
+					"discord.custom_id": interaction.customId,
+					"discord.user_id": interaction.user.id,
+					"discord.guild_id": interaction.guildId ?? "dm",
+				},
+				async () => {
+					await handleLeaderboardButton(interaction);
+				},
+			);
 		}
 		return;
 	}
@@ -51,32 +69,23 @@ client.on(Events.InteractionCreate, async (interaction) => {
 	);
 
 	if (!command) {
-		console.error(`Unknown command: ${interaction.commandName}`);
+		logger.warn("Unknown command", { command: interaction.commandName });
 		return;
 	}
 
-	try {
-		await command.execute(interaction as ChatInputCommandInteraction);
-	} catch (error) {
-		console.error(`Error executing command ${interaction.commandName}:`, error);
-
-		if (interaction.replied || interaction.deferred) {
-			await interaction.followUp({
-				content: "There was an error executing this command.",
-				ephemeral: true,
-			});
-		} else {
-			await interaction.reply({
-				content: "There was an error executing this command.",
-				ephemeral: true,
-			});
-		}
-	}
+	await executeWithTelemetry(
+		interaction.commandName,
+		interaction as ChatInputCommandInteraction,
+		command.execute,
+	);
 });
 
 // Ready event
 client.once(Events.ClientReady, async (readyClient) => {
-	console.log(`Logged in as ${readyClient.user.tag}`);
+	logger.info("Bot ready", {
+		username: readyClient.user.tag,
+		guilds: readyClient.guilds.cache.size,
+	});
 
 	// Register slash commands
 	await registerCommands();
