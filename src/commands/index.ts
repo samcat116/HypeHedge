@@ -1,4 +1,9 @@
-import { type ChatInputCommandInteraction, REST, Routes } from "discord.js";
+import {
+	type ChatInputCommandInteraction,
+	MessageFlags,
+	REST,
+	Routes,
+} from "discord.js";
 import { config } from "../config.js";
 import { withSpan } from "../telemetry/index.js";
 import { logger } from "../telemetry/logger.js";
@@ -61,16 +66,20 @@ export async function executeWithTelemetry(
 				});
 
 				// Send error response to user
-				if (interaction.replied || interaction.deferred) {
-					await interaction.followUp({
-						content: "There was an error executing this command.",
-						ephemeral: true,
-					});
-				} else {
-					await interaction.reply({
-						content: "There was an error executing this command.",
-						ephemeral: true,
-					});
+				try {
+					if (interaction.replied || interaction.deferred) {
+						await interaction.followUp({
+							content: "There was an error executing this command.",
+							flags: MessageFlags.Ephemeral,
+						});
+					} else {
+						await interaction.reply({
+							content: "There was an error executing this command.",
+							flags: MessageFlags.Ephemeral,
+						});
+					}
+				} catch {
+					// Interaction may have expired, ignore
 				}
 			} finally {
 				const duration = performance.now() - startTime;

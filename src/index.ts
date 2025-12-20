@@ -14,7 +14,14 @@ import {
 	registerCommands,
 } from "./commands/index.js";
 import { handleLeaderboardButton } from "./commands/leaderboard.js";
-import { handleMarketModalSubmit } from "./commands/market.js";
+import {
+	handleMarketAutocomplete,
+	handleMarketModalSubmit,
+	handleMarketQuickBuyButton,
+	handleMarketQuickBuyModalSubmit,
+	handleMarketResolveSelect,
+	handleMarketsListButton,
+} from "./commands/market.js";
 import { config } from "./config.js";
 import { initDatabase } from "./database.js";
 import * as reactionAdd from "./events/reactionAdd.js";
@@ -45,9 +52,60 @@ client.on(reactionRemove.name, reactionRemove.execute);
 
 // Handle interactions
 client.on(Events.InteractionCreate, async (interaction) => {
+	// Autocomplete
+	if (interaction.isAutocomplete()) {
+		if (interaction.commandName === "market") {
+			await withSpan(
+				"autocomplete.market",
+				{
+					"discord.interaction_type": "autocomplete",
+					"discord.command": interaction.commandName,
+					"discord.user_id": interaction.user.id,
+					"discord.guild_id": interaction.guildId ?? "dm",
+				},
+				async () => {
+					await handleMarketAutocomplete(interaction);
+				},
+			);
+		}
+		return;
+	}
+
+	// String select menus
+	if (interaction.isStringSelectMenu()) {
+		if (interaction.customId.startsWith("market:resolve:")) {
+			await withSpan(
+				"select.market_resolve",
+				{
+					"discord.interaction_type": "string_select",
+					"discord.custom_id": interaction.customId,
+					"discord.user_id": interaction.user.id,
+					"discord.guild_id": interaction.guildId ?? "dm",
+				},
+				async () => {
+					await handleMarketResolveSelect(interaction);
+				},
+			);
+		}
+		return;
+	}
+
 	// Modal submissions
 	if (interaction.isModalSubmit()) {
-		if (interaction.customId.startsWith("market:")) {
+		if (interaction.customId.startsWith("market:quickbuy:confirm:")) {
+			await withSpan(
+				"modal.market_quickbuy",
+				{
+					"discord.interaction_type": "modal_submit",
+					"discord.custom_id": interaction.customId,
+					"discord.user_id": interaction.user.id,
+					"discord.guild_id": interaction.guildId ?? "dm",
+				},
+				async () => {
+					await handleMarketQuickBuyModalSubmit(interaction);
+				},
+			);
+		} else if (interaction.customId.startsWith("market:")) {
 			await withSpan(
 				"modal.market",
 				{
@@ -77,6 +135,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
 				},
 				async () => {
 					await handleLeaderboardButton(interaction);
+				},
+			);
+		} else if (interaction.customId.startsWith("markets:")) {
+			await withSpan(
+				"button.markets",
+				{
+					"discord.interaction_type": "button",
+					"discord.custom_id": interaction.customId,
+					"discord.user_id": interaction.user.id,
+					"discord.guild_id": interaction.guildId ?? "dm",
+				},
+				async () => {
+					await handleMarketsListButton(interaction);
+				},
+			);
+		} else if (interaction.customId.startsWith("market:quickbuy:")) {
+			await withSpan(
+				"button.market_quickbuy",
+				{
+					"discord.interaction_type": "button",
+					"discord.custom_id": interaction.customId,
+					"discord.user_id": interaction.user.id,
+					"discord.guild_id": interaction.guildId ?? "dm",
+				},
+				async () => {
+					await handleMarketQuickBuyButton(interaction);
 				},
 			);
 		}
