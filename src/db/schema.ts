@@ -66,3 +66,57 @@ export const reactions = pgTable(
 		uniqueReaction: unique().on(table.messageId, table.reactorId, table.emoji),
 	}),
 );
+
+export const marketPools = pgTable("market_pools", {
+	id: bigserial("id", { mode: "number" }).primaryKey(),
+	marketId: bigserial("market_id", { mode: "number" })
+		.notNull()
+		.references(() => markets.id)
+		.unique(),
+	liquidity: integer("liquidity").notNull().default(100),
+	outcomeShares: text("outcome_shares").notNull(), // JSON: {"Yes": 0, "No": 0}
+	createdAt: timestamp("created_at", { withTimezone: true })
+		.notNull()
+		.defaultNow(),
+	updatedAt: timestamp("updated_at", { withTimezone: true })
+		.notNull()
+		.defaultNow(),
+});
+
+export const positions = pgTable(
+	"positions",
+	{
+		id: bigserial("id", { mode: "number" }).primaryKey(),
+		marketId: bigserial("market_id", { mode: "number" })
+			.notNull()
+			.references(() => markets.id),
+		userId: text("user_id").notNull(),
+		outcome: text("outcome").notNull(), // "Yes"/"No" or option name
+		shares: integer("shares").notNull().default(0),
+		avgCostBasis: integer("avg_cost_basis").notNull().default(0), // Average price paid per share
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+		updatedAt: timestamp("updated_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+	},
+	(table) => ({
+		uniquePosition: unique().on(table.marketId, table.userId, table.outcome),
+	}),
+);
+
+export const trades = pgTable("trades", {
+	id: bigserial("id", { mode: "number" }).primaryKey(),
+	marketId: bigserial("market_id", { mode: "number" })
+		.notNull()
+		.references(() => markets.id),
+	userId: text("user_id").notNull(),
+	outcome: text("outcome").notNull(),
+	tradeType: text("trade_type").notNull(), // "buy" | "sell"
+	shares: integer("shares").notNull(),
+	price: integer("price").notNull(), // Total cost/proceeds
+	createdAt: timestamp("created_at", { withTimezone: true })
+		.notNull()
+		.defaultNow(),
+});

@@ -105,6 +105,10 @@ async function processChannel(
 	progress: ProgressState,
 	updateProgress: () => void,
 ): Promise<ChannelResult> {
+	logger.info(`Starting channel processing: #${textChannel.name}`, {
+		channelId: textChannel.id,
+	});
+
 	return withSpan(
 		"backfill.channel",
 		{
@@ -145,6 +149,14 @@ async function processChannel(
 				let channelMessages = channelProgress.messagesProcessed;
 				let channelReactions = channelProgress.reactionsAdded;
 
+				logger.info(`Channel progress loaded: #${textChannel.name}`, {
+					channelId: textChannel.id,
+					status: channelProgress.status,
+					lastMessageId: lastMessageId ?? "none (starting fresh)",
+					messagesProcessed: channelMessages,
+					reactionsAdded: channelReactions,
+				});
+
 				progress.channelsInProgress.add(textChannel.name);
 				updateProgress();
 
@@ -169,6 +181,16 @@ async function processChannel(
 								...(lastMessageId && { before: lastMessageId }),
 							});
 
+							const firstMsgId = messages.first()?.id;
+							const lastMsgId = messages.last()?.id;
+							logger.debug(`Fetched batch in #${textChannel.name}`, {
+								channelId: textChannel.id,
+								beforeCursor: lastMessageId ?? "none",
+								fetchedCount: messages.size,
+								newestMessageId: firstMsgId,
+								oldestMessageId: lastMsgId,
+							});
+
 							if (messages.size === 0) {
 								batchSpan.addEvent("no_more_messages");
 								return { done: true, messagesCount: 0, reactionsCount: 0 };
@@ -179,6 +201,17 @@ async function processChannel(
 
 							for (const [, message] of messages) {
 								if (message.author.bot) continue;
+
+								const reactionCount = message.reactions.cache.size;
+								if (reactionCount > 0) {
+									logger.debug(
+										`Processing message with ${reactionCount} reactions`,
+										{
+											channelId: textChannel.id,
+											messageId: message.id,
+										},
+									);
+								}
 
 								for (const [, reaction] of message.reactions.cache) {
 									const emoji =
@@ -198,8 +231,13 @@ async function processChannel(
 												emoji,
 											});
 										}
-									} catch {
-										// Reaction may have been removed, continue
+									} catch (err) {
+										logger.warn("Failed to fetch reaction users", {
+											channelId: textChannel.id,
+											messageId: message.id,
+											emoji,
+											error: err instanceof Error ? err.message : String(err),
+										});
 									}
 								}
 
@@ -228,6 +266,14 @@ async function processChannel(
 								"backfill.reactions_added": added,
 							});
 
+							logger.info(`Batch completed in #${textChannel.name}`, {
+								channelId: textChannel.id,
+								messagesInBatch: messages.size,
+								reactionsAdded: added,
+								totalChannelMessages: channelMessages,
+								totalChannelReactions: channelReactions,
+							});
+
 							return {
 								done: false,
 								messagesCount: messages.size,
@@ -237,6 +283,12 @@ async function processChannel(
 					);
 
 					const batchDuration = performance.now() - batchStartTime;
+					if (batchDuration > 5000) {
+						logger.warn(`Slow batch in #${textChannel.name}`, {
+							channelId: textChannel.id,
+							durationMs: Math.round(batchDuration),
+						});
+					}
 					backfillBatchDuration.record(batchDuration, {
 						channel_id: textChannel.id,
 					});
@@ -261,6 +313,12 @@ async function processChannel(
 
 				result.messagesProcessed = channelMessages;
 				result.reactionsAdded = channelReactions;
+
+				logger.info(`Channel completed: #${textChannel.name}`, {
+					channelId: textChannel.id,
+					messagesProcessed: channelMessages,
+					reactionsAdded: channelReactions,
+				});
 
 				channelSpan.setAttributes({
 					"backfill.total_messages": channelMessages,
@@ -293,6 +351,11 @@ export async function execute(
 		});
 		return;
 	}
+
+	// Defer reply immediately - subsequent operations may take time
+	logger.info("Deferring backfill reply...");
+	await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+	logger.info("Backfill reply deferred successfully");
 
 	const limit = interaction.options.getInteger("limit") ?? null;
 	const reset = interaction.options.getBoolean("reset") ?? false;
@@ -333,10 +396,26 @@ export async function execute(
 	// Reset stale in_progress records (crashed runs)
 	await resetStaleProgress(guildId);
 
-	// Get accessible text channels
+	// Fetch all channels from API (cache may be incomplete)
+	await guild.channels.fetch();
+	logger.info("Channels in cache after fetch", {
+		total: guild.channels.cache.size,
+		byType: Object.fromEntries(
+			[...guild.channels.cache.values()].reduce((acc, ch) => {
+				const type = ChannelType[ch.type] ?? String(ch.type);
+				acc.set(type, (acc.get(type) ?? 0) + 1);
+				return acc;
+			}, new Map<string, number>()),
+		),
+	});
+
 	const channels = guild.channels.cache.filter(
-		(channel) => channel.type === ChannelType.GuildText,
+		(channel) =>
+			channel.type === ChannelType.GuildText ||
+			channel.type === ChannelType.GuildAnnouncement,
 	);
+	logger.info("Text/announcement channels found", { count: channels.size });
+
 	const accessibleChannels: TextChannel[] = [];
 
 	for (const [, channel] of channels) {
@@ -351,19 +430,21 @@ export async function execute(
 			accessibleChannels.push(textChannel);
 		}
 	}
+	logger.info("Accessible channels after permission check", {
+		count: accessibleChannels.length,
+		channels: accessibleChannels.map((c) => c.name),
+	});
 
-	// Initial reply
+	// Initial status message
 	if (hasExistingProgress && !reset) {
-		await interaction.reply({
+		await interaction.editReply({
 			content: `Resuming backfill from previous run...\nPreviously: ${completedChannels} channels done, ${previousMessages.toLocaleString()} messages, ${previousReactions.toLocaleString()} reactions\nProcessing ${accessibleChannels.length} channels with concurrency ${concurrency}`,
-			flags: MessageFlags.Ephemeral,
 		});
 	} else {
-		await interaction.reply({
+		await interaction.editReply({
 			content: limit
 				? `Starting backfill... Scanning up to ${limit} messages per channel.\nProcessing ${accessibleChannels.length} channels with concurrency ${concurrency}`
 				: `Starting backfill... Scanning all message history.\nProcessing ${accessibleChannels.length} channels with concurrency ${concurrency}`,
-			flags: MessageFlags.Ephemeral,
 		});
 	}
 
@@ -421,15 +502,23 @@ export async function execute(
 
 		const inProgressText =
 			progress.channelsInProgress.size > 0
-				? `\nProcessing: ${[...progress.channelsInProgress].map((c) => `#${c}`).join(", ")}`
+				? ` | Processing: ${[...progress.channelsInProgress].map((c) => `#${c}`).join(", ")}`
 				: "";
+
+		logger.info("Backfill progress", {
+			channelsCompleted: progress.channelsCompleted,
+			totalChannels: accessibleChannels.length,
+			messagesScanned: progress.totalMessages,
+			reactionsAdded: progress.totalReactions,
+			inProgress: [...progress.channelsInProgress],
+		});
 
 		try {
 			await interaction.editReply({
 				content: `Backfill in progress...\nChannels: ${progress.channelsCompleted}/${accessibleChannels.length} completed${inProgressText}\nMessages scanned: ${progress.totalMessages.toLocaleString()}\nReactions added: ${progress.totalReactions.toLocaleString()}`,
 			});
 		} catch {
-			// Ignore edit errors
+			// Interaction likely expired (15 min limit) - progress continues in logs
 		}
 	};
 

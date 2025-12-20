@@ -15,6 +15,13 @@
       "when": 1765858685609,
       "tag": "0001_chunky_maelstrom",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1765995309900,
+      "tag": "0002_spicy_hitman",
+      "breakpoints": true
     }
   ]
 }
