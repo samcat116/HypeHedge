@@ -561,6 +561,16 @@ export async function resolveMarket(
 					),
 				);
 
+			logger.info("Queried winning positions", {
+				marketId,
+				resolution,
+				winningPositionsCount: winningPositions.length,
+				winningPositions: winningPositions.map((p) => ({
+					userId: p.userId,
+					shares: p.shares,
+				})),
+			});
+
 			// 3. Calculate and process payouts (1 coin per share)
 			const payouts: PayoutInfo[] = [];
 			let totalPayout = 0;
@@ -754,6 +764,12 @@ export async function buyShares(
 					outcome,
 					shares,
 					avgCostBasis: Math.ceil(cost / shares),
+				});
+				logger.info("Created new position", {
+					marketId,
+					userId,
+					outcome,
+					shares,
 				});
 			}
 

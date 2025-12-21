@@ -1,4 +1,5 @@
 import {
+	bigint,
 	bigserial,
 	integer,
 	pgTable,
@@ -69,7 +70,7 @@ export const reactions = pgTable(
 
 export const marketPools = pgTable("market_pools", {
 	id: bigserial("id", { mode: "number" }).primaryKey(),
-	marketId: bigserial("market_id", { mode: "number" })
+	marketId: bigint("market_id", { mode: "number" })
 		.notNull()
 		.references(() => markets.id)
 		.unique(),
@@ -87,7 +88,7 @@ export const positions = pgTable(
 	"positions",
 	{
 		id: bigserial("id", { mode: "number" }).primaryKey(),
-		marketId: bigserial("market_id", { mode: "number" })
+		marketId: bigint("market_id", { mode: "number" })
 			.notNull()
 			.references(() => markets.id),
 		userId: text("user_id").notNull(),
@@ -108,7 +109,7 @@ export const positions = pgTable(
 
 export const trades = pgTable("trades", {
 	id: bigserial("id", { mode: "number" }).primaryKey(),
-	marketId: bigserial("market_id", { mode: "number" })
+	marketId: bigint("market_id", { mode: "number" })
 		.notNull()
 		.references(() => markets.id),
 	userId: text("user_id").notNull(),
