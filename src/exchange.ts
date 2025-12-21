@@ -133,10 +133,17 @@ interface MatchResult {
 }
 
 /**
- * Find the best synthetic (triangle) match across all outcomes.
+ * Find the best synthetic (triangle) match from any subset of outcomes.
  *
- * A synthetic match occurs when buy orders across different outcomes
+ * A synthetic match occurs when buy orders across ANY subset of outcomes
  * sum to >= 1.0, allowing the exchange to "mint" a complete basket.
+ * Surplus contracts from the mint are distributed to participants pro-rata.
+ *
+ * Algorithm:
+ * 1. Get best bid for each outcome that has orders
+ * 2. Sort outcomes by best bid price descending
+ * 3. Greedily add outcomes until sum >= 1.0
+ * 4. Return the matching subset with surplus info
  */
 function findSyntheticMatch(
 	buyOrdersByOutcome: Map<Snowflake, OrderForMatching[]>,
@@ -144,46 +151,66 @@ function findSyntheticMatch(
 ): {
 	matchQuantity: number;
 	participants: Map<Snowflake, OrderForMatching[]>;
+	participatingOutcomeIds: Snowflake[];
 	totalPrice: number;
 } | null {
-	// Need at least one buy order per outcome for a complete basket
-	for (const outcomeId of outcomeIds) {
-		const orders = buyOrdersByOutcome.get(outcomeId);
-		if (!orders || orders.length === 0) {
-			return null;
-		}
-	}
-
 	// Sort orders by price descending for each outcome
 	for (const orders of buyOrdersByOutcome.values()) {
 		orders.sort((a, b) => b.price - a.price);
 	}
 
-	// Check if the sum of best prices >= 1.0
-	let totalBestPrice = 0;
+	// Get best bid for each outcome that has orders
+	const outcomesWithBids: Array<{
+		outcomeId: Snowflake;
+		bestOrder: OrderForMatching;
+		price: number;
+	}> = [];
+
 	for (const outcomeId of outcomeIds) {
 		const orders = buyOrdersByOutcome.get(outcomeId);
 		if (orders && orders.length > 0) {
-			totalBestPrice += orders[0].price;
+			outcomesWithBids.push({
+				outcomeId,
+				bestOrder: orders[0],
+				price: orders[0].price,
+			});
 		}
 	}
 
-	if (totalBestPrice < 1.0) {
+	if (outcomesWithBids.length === 0) {
+		return null;
+	}
+
+	// Sort by price descending to greedily select highest-value bids first
+	outcomesWithBids.sort((a, b) => b.price - a.price);
+
+	// Greedily add outcomes until we reach >= 1.0
+	let totalPrice = 0;
+	const selectedOutcomes: typeof outcomesWithBids = [];
+
+	for (const outcome of outcomesWithBids) {
+		selectedOutcomes.push(outcome);
+		totalPrice += outcome.price;
+
+		if (totalPrice >= 1.0) {
+			break;
+		}
+	}
+
+	// Check if we found a valid match
+	if (totalPrice < 1.0) {
 		return null; // No synthetic match possible
 	}
 
 	// Find the maximum quantity we can match (limited by smallest order)
 	let maxQuantity = Number.POSITIVE_INFINITY;
 	const participants = new Map<Snowflake, OrderForMatching[]>();
+	const participatingOutcomeIds: Snowflake[] = [];
 
-	for (const outcomeId of outcomeIds) {
-		const orders = buyOrdersByOutcome.get(outcomeId);
-		if (orders && orders.length > 0) {
-			// For now, use greedy approach: take best-priced order first
-			const bestOrder = orders[0];
-			maxQuantity = Math.min(maxQuantity, bestOrder.remainingQuantity);
-			participants.set(outcomeId, [bestOrder]);
-		}
+	for (const { outcomeId, bestOrder } of selectedOutcomes) {
+		maxQuantity = Math.min(maxQuantity, bestOrder.remainingQuantity);
+		participants.set(outcomeId, [bestOrder]);
+		participatingOutcomeIds.push(outcomeId);
 	}
 
 	if (maxQuantity === 0 || maxQuantity === Number.POSITIVE_INFINITY) {
@@ -193,7 +220,8 @@ function findSyntheticMatch(
 	return {
 		matchQuantity: maxQuantity,
 		participants,
-		totalPrice: totalBestPrice,
+		participatingOutcomeIds,
+		totalPrice,
 	};
 }
 
@@ -273,39 +301,72 @@ export function executeMatching(
 
 		if (syntheticMatch) {
 			matchFound = true;
-			const { matchQuantity, participants, totalPrice } = syntheticMatch;
+			const {
+				matchQuantity,
+				participants,
+				participatingOutcomeIds,
+				totalPrice,
+			} = syntheticMatch;
 
-			// Calculate surplus to redistribute
-			const surplus = totalPrice - 1.0;
-			const surplusPerOutcome = surplus / outcomeIds.length;
+			// Calculate total contribution for pro-rata distribution of surplus contracts
+			let totalContribution = 0;
+			for (const [, matchedOrders] of participants) {
+				for (const order of matchedOrders) {
+					totalContribution += order.price;
+				}
+			}
 
 			const executionParticipants: Party[] = [];
+
+			// Non-participating outcomes (outcomes not in this match) will have
+			// surplus contracts minted and distributed pro-rata to participants
+			const nonParticipatingOutcomeIds = outcomeIds.filter(
+				(id) => !participatingOutcomeIds.includes(id),
+			);
 
 			// Process each participant in the match
 			for (const [outcomeId, matchedOrders] of participants) {
 				for (const order of matchedOrders) {
-					// Calculate effective price after surplus redistribution
-					const effectivePrice = order.price - surplusPerOutcome;
+					// Each participant pays their bid price
+					const fillCost = matchQuantity * order.price;
 
-					// Calculate actual cost for this fill
-					const fillCost = matchQuantity * effectivePrice;
-
-					// The escrowed amount was at original price
+					// The escrowed amount was at original price, all used
 					const escrowUsed = matchQuantity * order.price;
-					const escrowRefund = escrowUsed - fillCost;
 
-					// Update user balance: refund surplus from escrow
-					updateUserBalance(order.userId, escrowRefund, -escrowUsed);
+					// Update user balance: deduct escrow (already locked)
+					updateUserBalance(order.userId, 0, -escrowUsed);
 
 					// Decrement order quantity
 					order.remainingQuantity -= matchQuantity;
 
-					// Add position update
+					// Add position update for the outcome they bid on
 					result.positionUpdates.push({
 						userId: order.userId,
 						outcomeId,
 						quantityDelta: matchQuantity,
 					});
+
+					// Calculate pro-rata share of surplus contracts for non-participating outcomes
+					// Their share is proportional to their contribution (price * quantity)
+					const contributionShare = order.price / totalContribution;
+
+					// Distribute surplus contracts for outcomes not in the match
+					// When we mint a basket, we get 1 contract for EACH outcome
+					// Participants only want their specific outcome, so the others are surplus
+					for (const surplusOutcomeId of nonParticipatingOutcomeIds) {
+						const surplusQuantity = matchQuantity * contributionShare;
+						if (surplusQuantity > 0) {
+							result.positionUpdates.push({
+								userId: order.userId,
+								outcomeId: surplusOutcomeId,
+								quantityDelta: surplusQuantity,
+							});
+						}
+					}
+
+					// Calculate effective price (what they actually paid per contract of their outcome)
+					// They paid order.price but also received surplus contracts worth something
+					const effectivePrice = order.price;
 
 					// Add to execution participants
 					executionParticipants.push({
@@ -325,8 +386,8 @@ export function executeMatching(
 				participants: executionParticipants,
 			});
 
-			// Clean up fully filled orders
-			for (const outcomeId of outcomeIds) {
+			// Clean up fully filled orders from participating outcomes only
+			for (const outcomeId of participatingOutcomeIds) {
 				const orders = buyOrdersByOutcome.get(outcomeId);
 				if (orders) {
 					const remaining = orders.filter((o) => o.remainingQuantity > 0);
