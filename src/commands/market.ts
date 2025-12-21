@@ -1007,8 +1007,13 @@ export async function handleMarketResolveSelect(
 			.setTimestamp();
 
 		await interaction.update({
-			embeds: [embed],
+			content: "Market resolved!",
+			embeds: [],
 			components: [],
+		});
+
+		await interaction.followUp({
+			embeds: [embed],
 		});
 	} catch (error) {
 		logger.error("Failed to resolve market", {
