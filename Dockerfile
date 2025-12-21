@@ -11,6 +11,8 @@ FROM base AS release
 COPY --from=install /app/node_modules ./node_modules
 COPY src ./src
 COPY package.json tsconfig.json ./
+COPY drizzle.config.ts ./
+COPY drizzle ./drizzle
 
 # Create directory for database persistence
 RUN mkdir -p /app/data
