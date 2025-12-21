@@ -29,6 +29,13 @@
       "when": 1766285686707,
       "tag": "0003_old_zaladane",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1766330000000,
+      "tag": "0004_p2p_exchange",
+      "breakpoints": true
     }
   ]
 }

@@ -17,8 +17,8 @@ import { handleLeaderboardButton } from "./commands/leaderboard.js";
 import {
 	handleMarketAutocomplete,
 	handleMarketModalSubmit,
-	handleMarketQuickBuyButton,
-	handleMarketQuickBuyModalSubmit,
+	handleMarketQuickOrderButton,
+	handleMarketQuickOrderModalSubmit,
 	handleMarketResolveSelect,
 	handleMarketsListButton,
 } from "./commands/market.js";
@@ -92,9 +92,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 	// Modal submissions
 	if (interaction.isModalSubmit()) {
-		if (interaction.customId.startsWith("market:quickbuy:confirm:")) {
+		if (interaction.customId.startsWith("market:quickorder:confirm:")) {
 			await withSpan(
-				"modal.market_quickbuy",
+				"modal.market_quickorder",
 				{
 					"discord.interaction_type": "modal_submit",
 					"discord.custom_id": interaction.customId,
@@ -102,7 +102,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 					"discord.guild_id": interaction.guildId ?? "dm",
 				},
 				async () => {
-					await handleMarketQuickBuyModalSubmit(interaction);
+					await handleMarketQuickOrderModalSubmit(interaction);
 				},
 			);
 		} else if (interaction.customId.startsWith("market:")) {
@@ -150,9 +150,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 					await handleMarketsListButton(interaction);
 				},
 			);
-		} else if (interaction.customId.startsWith("market:quickbuy:")) {
+		} else if (interaction.customId.startsWith("market:quickorder:")) {
 			await withSpan(
-				"button.market_quickbuy",
+				"button.market_quickorder",
 				{
 					"discord.interaction_type": "button",
 					"discord.custom_id": interaction.customId,
@@ -160,7 +160,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 					"discord.guild_id": interaction.guildId ?? "dm",
 				},
 				async () => {
-					await handleMarketQuickBuyButton(interaction);
+					await handleMarketQuickOrderButton(interaction);
 				},
 			);
 		}

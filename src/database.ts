@@ -1,24 +1,26 @@
-import { and, desc, eq, gt, gte, lt, sql } from "drizzle-orm";
-import {
-	type PoolState,
-	calculateBuyCost,
-	calculateSellProceeds,
-	getAllPrices,
-	getPrice,
-	initializePool,
-	parsePoolState,
-	serializeOutcomeShares,
-} from "./amm.js";
+import { and, desc, eq, gt, lt, sql } from "drizzle-orm";
 import { db } from "./db";
 import {
 	backfillProgress,
-	marketPools,
+	executions,
 	markets,
+	orders,
+	outcomes,
 	positions,
 	reactions,
-	trades,
 	users,
 } from "./db/schema";
+import {
+	type Direction,
+	type Execution,
+	type Order,
+	type Party,
+	type Position,
+	calculateEscrow,
+	calculatePayout,
+	executeMatching,
+	generateId,
+} from "./exchange.js";
 import { withSpan } from "./telemetry/index.js";
 import { logger } from "./telemetry/logger.js";
 import {
@@ -69,6 +71,10 @@ export async function initDatabase(): Promise<void> {
 	logger.info("Connected to database");
 }
 
+// ============================================================================
+// Reaction-based currency functions (unchanged)
+// ============================================================================
+
 export async function addReaction(
 	messageId: string,
 	reactorId: string,
@@ -88,7 +94,7 @@ export async function addReaction(
 			await withDbSpan("upsert", "users", async () => {
 				await db
 					.insert(users)
-					.values({ discordId: authorId, balance: 1 })
+					.values({ discordId: authorId, balance: 1, locked: 0 })
 					.onConflictDoUpdate({
 						target: users.discordId,
 						set: { balance: sql`${users.balance} + 1` },
@@ -145,14 +151,18 @@ export async function removeReaction(
 	});
 }
 
-export async function getBalance(userId: string): Promise<number> {
+export async function getBalance(
+	userId: string,
+): Promise<{ balance: number; locked: number; available: number }> {
 	return withDbSpan("select", "users", async () => {
 		const [user] = await db
-			.select({ balance: users.balance })
+			.select({ balance: users.balance, locked: users.locked })
 			.from(users)
 			.where(eq(users.discordId, userId));
 
-		return user?.balance ?? 0;
+		const balance = user?.balance ?? 0;
+		const locked = user?.locked ?? 0;
+		return { balance, locked, available: balance - locked };
 	});
 }
 
@@ -174,7 +184,7 @@ export async function getLeaderboard(limit = 10): Promise<LeaderboardEntry[]> {
 			.orderBy(desc(users.balance))
 			.limit(limit);
 
-		return results.map((r, i) => ({ ...r, rank: i + 1 }));
+		return results.map((r, i) => ({ ...r, balance: r.balance, rank: i + 1 }));
 	});
 }
 
@@ -211,6 +221,7 @@ export async function getLeaderboardPaginated(
 		const totalCount = Number(countResult[0]?.count ?? 0);
 		const entries = results.map((r, i) => ({
 			...r,
+			balance: r.balance,
 			rank: offset + i + 1,
 		}));
 
@@ -222,7 +233,9 @@ export async function getLeaderboardPaginated(
 	});
 }
 
-// Backfill progress functions
+// ============================================================================
+// Backfill progress functions (unchanged)
+// ============================================================================
 
 export type BackfillProgressRecord = typeof backfillProgress.$inferSelect;
 
@@ -368,7 +381,7 @@ export async function addReactionsBatch(
 			for (const [authorId, count] of authorCounts) {
 				await db
 					.insert(users)
-					.values({ discordId: authorId, balance: count })
+					.values({ discordId: authorId, balance: count, locked: 0 })
 					.onConflictDoUpdate({
 						target: users.discordId,
 						set: { balance: sql`${users.balance} + ${count}` },
@@ -380,91 +393,167 @@ export async function addReactionsBatch(
 	});
 }
 
-// Market functions
+// ============================================================================
+// Market functions (P2P Exchange)
+// ============================================================================
 
 export type MarketRecord = typeof markets.$inferSelect;
+export type OutcomeRecord = typeof outcomes.$inferSelect;
+export type OrderRecord = typeof orders.$inferSelect;
+export type PositionRecord = typeof positions.$inferSelect;
+
+export interface MarketWithOutcomes extends MarketRecord {
+	outcomes: OutcomeRecord[];
+}
 
 export interface CreateMarketParams {
 	guildId: string;
 	creatorId: string;
-	oracleId: string;
+	oracleUserId: string;
 	description: string;
-	outcomeType: "binary" | "multi";
-	options?: string[];
-}
-
-export interface PayoutInfo {
-	userId: string;
-	shares: number;
-	payout: number;
-}
-
-export interface ResolveMarketResult {
-	market: MarketRecord;
-	payouts: PayoutInfo[];
-	totalPayout: number;
-	winnerCount: number;
+	outcomeDescriptions: string[];
 }
 
 export async function createMarket(
 	params: CreateMarketParams,
-): Promise<MarketRecord> {
+): Promise<MarketWithOutcomes> {
 	return withDbSpan("insert", "markets", async () => {
+		const marketId = generateId();
+
+		// Create market
 		const [market] = await db
 			.insert(markets)
 			.values({
+				id: marketId,
 				guildId: params.guildId,
 				creatorId: params.creatorId,
-				oracleId: params.oracleId,
 				description: params.description,
-				outcomeType: params.outcomeType,
-				options: params.options ?? null,
+				oracleType: "manual",
+				oracleUserId: params.oracleUserId,
 			})
 			.returning();
 
-		// Create AMM pool for the market
-		const outcomes =
-			params.outcomeType === "binary" ? ["Yes", "No"] : (params.options ?? []);
-		const pool = initializePool(outcomes);
-
-		await db.insert(marketPools).values({
-			marketId: market.id,
-			liquidity: pool.liquidity,
-			outcomeShares: serializeOutcomeShares(pool.outcomeShares),
-		});
-
-		return market;
-	});
-}
-
-export async function getMarket(id: number): Promise<MarketRecord | null> {
-	return withDbSpan("select", "markets", async () => {
-		const [market] = await db.select().from(markets).where(eq(markets.id, id));
-
-		return market ?? null;
-	});
-}
-
-export async function getGuildMarkets(
-	guildId: string,
-	status?: "open" | "resolved",
-): Promise<MarketRecord[]> {
-	return withDbSpan("select", "markets", async () => {
-		const conditions = [eq(markets.guildId, guildId)];
-		if (status) {
-			conditions.push(eq(markets.status, status));
+		// Create outcomes
+		const outcomeRecords: OutcomeRecord[] = [];
+		for (let i = 0; i < params.outcomeDescriptions.length; i++) {
+			const [outcome] = await db
+				.insert(outcomes)
+				.values({
+					id: generateId(),
+					marketId,
+					number: i + 1,
+					description: params.outcomeDescriptions[i],
+				})
+				.returning();
+			outcomeRecords.push(outcome);
 		}
 
-		return db
+		return { ...market, outcomes: outcomeRecords };
+	});
+}
+
+export async function getMarket(
+	marketId: string,
+): Promise<MarketWithOutcomes | null> {
+	return withDbSpan("select", "markets", async () => {
+		const [market] = await db
 			.select()
 			.from(markets)
-			.where(and(...conditions))
+			.where(eq(markets.id, marketId));
+
+		if (!market) return null;
+
+		const marketOutcomes = await db
+			.select()
+			.from(outcomes)
+			.where(eq(outcomes.marketId, marketId))
+			.orderBy(outcomes.number);
+
+		return { ...market, outcomes: marketOutcomes };
+	});
+}
+
+export async function getMarketByNumber(
+	guildId: string,
+	marketNumber: number,
+): Promise<MarketWithOutcomes | null> {
+	return withDbSpan("select", "markets", async () => {
+		const [market] = await db
+			.select()
+			.from(markets)
+			.where(
+				and(eq(markets.guildId, guildId), eq(markets.number, marketNumber)),
+			);
+
+		if (!market) return null;
+
+		const marketOutcomes = await db
+			.select()
+			.from(outcomes)
+			.where(eq(outcomes.marketId, market.id))
+			.orderBy(outcomes.number);
+
+		return { ...market, outcomes: marketOutcomes };
+	});
+}
+
+export async function getGuildOpenMarkets(
+	guildId: string,
+): Promise<MarketWithOutcomes[]> {
+	return withDbSpan("select", "markets", async () => {
+		const marketRecords = await db
+			.select()
+			.from(markets)
+			.where(and(eq(markets.guildId, guildId), eq(markets.status, "open")))
 			.orderBy(desc(markets.createdAt));
+
+		const result: MarketWithOutcomes[] = [];
+		for (const market of marketRecords) {
+			const marketOutcomes = await db
+				.select()
+				.from(outcomes)
+				.where(eq(outcomes.marketId, market.id))
+				.orderBy(outcomes.number);
+			result.push({ ...market, outcomes: marketOutcomes });
+		}
+
+		return result;
+	});
+}
+
+export async function getOracleOpenMarkets(
+	guildId: string,
+	oracleId: string,
+): Promise<MarketWithOutcomes[]> {
+	return withDbSpan("select", "markets", async () => {
+		const marketRecords = await db
+			.select()
+			.from(markets)
+			.where(
+				and(
+					eq(markets.guildId, guildId),
+					eq(markets.oracleUserId, oracleId),
+					eq(markets.status, "open"),
+				),
+			)
+			.orderBy(desc(markets.createdAt));
+
+		const result: MarketWithOutcomes[] = [];
+		for (const market of marketRecords) {
+			const marketOutcomes = await db
+				.select()
+				.from(outcomes)
+				.where(eq(outcomes.marketId, market.id))
+				.orderBy(outcomes.number);
+			result.push({ ...market, outcomes: marketOutcomes });
+		}
+
+		return result;
 	});
 }
 
 export interface PaginatedMarkets {
-	markets: MarketRecord[];
+	markets: MarketWithOutcomes[];
 	totalCount: number;
 	hasMore: boolean;
 }
@@ -482,7 +571,7 @@ export async function getGuildMarketsPaginated(
 			conditions.push(eq(markets.status, status));
 		}
 
-		const [results, countResult] = await Promise.all([
+		const [marketRecords, countResult] = await Promise.all([
 			db
 				.select()
 				.from(markets)
@@ -498,45 +587,537 @@ export async function getGuildMarketsPaginated(
 
 		const totalCount = Number(countResult[0]?.count ?? 0);
 
+		// Fetch outcomes for each market
+		const result: MarketWithOutcomes[] = [];
+		for (const market of marketRecords) {
+			const marketOutcomes = await db
+				.select()
+				.from(outcomes)
+				.where(eq(outcomes.marketId, market.id))
+				.orderBy(outcomes.number);
+			result.push({ ...market, outcomes: marketOutcomes });
+		}
+
 		return {
-			markets: results,
+			markets: result,
 			totalCount,
-			hasMore: offset + results.length < totalCount,
+			hasMore: offset + result.length < totalCount,
 		};
 	});
 }
 
-export async function getOracleOpenMarkets(
-	guildId: string,
-	oracleId: string,
-): Promise<MarketRecord[]> {
-	return withDbSpan("select", "markets", async () => {
-		return db
-			.select()
-			.from(markets)
-			.where(
-				and(
-					eq(markets.guildId, guildId),
-					eq(markets.oracleId, oracleId),
-					eq(markets.status, "open"),
-				),
-			)
-			.orderBy(desc(markets.createdAt));
+// ============================================================================
+// Order functions
+// ============================================================================
+
+export interface CreateOrderResult {
+	success: boolean;
+	order?: OrderRecord;
+	executions?: Execution[];
+	error?: string;
+}
+
+export async function createOrder(
+	userId: string,
+	marketId: string,
+	outcomeId: string,
+	direction: Direction,
+	quantity: number,
+	price: number,
+): Promise<CreateOrderResult> {
+	return withDbSpan("transaction", "orders", async () => {
+		return db.transaction(async (tx) => {
+			// 1. Verify market is open
+			const [market] = await tx
+				.select()
+				.from(markets)
+				.where(eq(markets.id, marketId));
+
+			if (!market || market.status !== "open") {
+				return { success: false, error: "Market not open" };
+			}
+
+			// 2. Verify outcome exists
+			const [outcome] = await tx
+				.select()
+				.from(outcomes)
+				.where(
+					and(eq(outcomes.id, outcomeId), eq(outcomes.marketId, marketId)),
+				);
+
+			if (!outcome) {
+				return { success: false, error: "Invalid outcome" };
+			}
+
+			// 3. Check user doesn't already have an order in this market
+			const [existingOrder] = await tx
+				.select()
+				.from(orders)
+				.where(and(eq(orders.userId, userId), eq(orders.marketId, marketId)));
+
+			if (existingOrder) {
+				return {
+					success: false,
+					error: "You already have an order in this market. Cancel it first.",
+				};
+			}
+
+			// 4. Get user's current holdings in this outcome
+			const [position] = await tx
+				.select()
+				.from(positions)
+				.where(
+					and(eq(positions.userId, userId), eq(positions.marketId, marketId)),
+				);
+
+			const holdings: Record<string, number> = position
+				? JSON.parse(position.holdings)
+				: {};
+			const currentlyOwned = holdings[outcomeId] ?? 0;
+
+			// 5. Calculate escrow required
+			const escrowAmount = calculateEscrow(
+				direction,
+				quantity,
+				price,
+				currentlyOwned,
+			);
+
+			// 6. Check user has sufficient available balance
+			const [user] = await tx
+				.select({ balance: users.balance, locked: users.locked })
+				.from(users)
+				.where(eq(users.discordId, userId));
+
+			const balance = user?.balance ?? 0;
+			const locked = user?.locked ?? 0;
+			const available = balance - locked;
+
+			if (available < escrowAmount) {
+				return {
+					success: false,
+					error: `Insufficient balance. Need ${escrowAmount.toFixed(2)}, have ${available.toFixed(2)} available`,
+				};
+			}
+
+			// 7. Lock the escrow amount
+			await tx
+				.update(users)
+				.set({ locked: sql`${users.locked} + ${escrowAmount}` })
+				.where(eq(users.discordId, userId));
+
+			// 8. Create the order
+			const orderId = generateId();
+			const [order] = await tx
+				.insert(orders)
+				.values({
+					id: orderId,
+					userId,
+					marketId,
+					outcomeId,
+					direction,
+					quantity,
+					price,
+					escrowAmount,
+				})
+				.returning();
+
+			return { success: true, order };
+		});
 	});
 }
 
+export async function cancelOrder(
+	userId: string,
+	marketId: string,
+): Promise<{ success: boolean; error?: string }> {
+	return withDbSpan("transaction", "orders", async () => {
+		return db.transaction(async (tx) => {
+			// 1. Find the order
+			const [order] = await tx
+				.select()
+				.from(orders)
+				.where(and(eq(orders.userId, userId), eq(orders.marketId, marketId)));
+
+			if (!order) {
+				return { success: false, error: "No order found in this market" };
+			}
+
+			// 2. Unlock escrowed funds
+			await tx
+				.update(users)
+				.set({ locked: sql`${users.locked} - ${order.escrowAmount}` })
+				.where(eq(users.discordId, userId));
+
+			// 3. Delete the order
+			await tx.delete(orders).where(eq(orders.id, order.id));
+
+			return { success: true };
+		});
+	});
+}
+
+export async function getOrder(
+	userId: string,
+	marketId: string,
+): Promise<OrderRecord | null> {
+	return withDbSpan("select", "orders", async () => {
+		const [order] = await db
+			.select()
+			.from(orders)
+			.where(and(eq(orders.userId, userId), eq(orders.marketId, marketId)));
+
+		return order ?? null;
+	});
+}
+
+export async function getUserOrders(userId: string): Promise<OrderRecord[]> {
+	return withDbSpan("select", "orders", async () => {
+		return db.select().from(orders).where(eq(orders.userId, userId));
+	});
+}
+
+export async function getMarketOrders(
+	marketId: string,
+): Promise<OrderRecord[]> {
+	return withDbSpan("select", "orders", async () => {
+		return db.select().from(orders).where(eq(orders.marketId, marketId));
+	});
+}
+
+export async function getUserMarketsWithOrders(
+	userId: string,
+	guildId: string,
+): Promise<MarketWithOutcomes[]> {
+	return withDbSpan("select", "orders", async () => {
+		const userOrders = await db
+			.select({ marketId: orders.marketId })
+			.from(orders)
+			.where(eq(orders.userId, userId));
+
+		const marketIds = userOrders.map((o) => o.marketId);
+		if (marketIds.length === 0) return [];
+
+		const result: MarketWithOutcomes[] = [];
+		for (const marketId of marketIds) {
+			const [market] = await db
+				.select()
+				.from(markets)
+				.where(and(eq(markets.id, marketId), eq(markets.guildId, guildId)));
+
+			if (market) {
+				const marketOutcomes = await db
+					.select()
+					.from(outcomes)
+					.where(eq(outcomes.marketId, marketId))
+					.orderBy(outcomes.number);
+				result.push({ ...market, outcomes: marketOutcomes });
+			}
+		}
+
+		return result;
+	});
+}
+
+// ============================================================================
+// Position functions
+// ============================================================================
+
+export async function getPosition(
+	userId: string,
+	marketId: string,
+): Promise<Position | null> {
+	return withDbSpan("select", "positions", async () => {
+		const [position] = await db
+			.select()
+			.from(positions)
+			.where(
+				and(eq(positions.userId, userId), eq(positions.marketId, marketId)),
+			);
+
+		if (!position) return null;
+
+		return {
+			userId: position.userId,
+			marketId: position.marketId,
+			holdings: JSON.parse(position.holdings),
+		};
+	});
+}
+
+export interface UserPositionView {
+	marketId: string;
+	marketNumber: number;
+	marketDescription: string;
+	marketStatus: string;
+	holdings: Record<string, number>;
+	order: OrderRecord | null;
+}
+
+export async function getUserPositions(
+	userId: string,
+	guildId?: string,
+): Promise<UserPositionView[]> {
+	return withDbSpan("select", "positions", async () => {
+		const conditions = [eq(positions.userId, userId)];
+		if (guildId) {
+			conditions.push(eq(markets.guildId, guildId));
+		}
+
+		const userPositions = await db
+			.select({
+				positionId: positions.id,
+				marketId: positions.marketId,
+				holdings: positions.holdings,
+				marketNumber: markets.number,
+				marketDescription: markets.description,
+				marketStatus: markets.status,
+			})
+			.from(positions)
+			.innerJoin(markets, eq(positions.marketId, markets.id))
+			.where(and(...conditions));
+
+		const result: UserPositionView[] = [];
+		for (const pos of userPositions) {
+			// Get user's order in this market if any
+			const [order] = await db
+				.select()
+				.from(orders)
+				.where(
+					and(eq(orders.userId, userId), eq(orders.marketId, pos.marketId)),
+				);
+
+			result.push({
+				marketId: pos.marketId,
+				marketNumber: pos.marketNumber,
+				marketDescription: pos.marketDescription,
+				marketStatus: pos.marketStatus,
+				holdings: JSON.parse(pos.holdings),
+				order: order ?? null,
+			});
+		}
+
+		return result;
+	});
+}
+
+// ============================================================================
+// Execution functions
+// ============================================================================
+
+export async function executeMarket(
+	marketId: string,
+): Promise<{ executions: Execution[]; error?: string }> {
+	return withDbSpan("transaction", "executions", async () => {
+		return db.transaction(async (tx) => {
+			// 1. Get market and verify it's open
+			const [market] = await tx
+				.select()
+				.from(markets)
+				.where(eq(markets.id, marketId));
+
+			if (!market || market.status !== "open") {
+				return { executions: [], error: "Market not open" };
+			}
+
+			// 2. Get all outcomes for this market
+			const marketOutcomes = await tx
+				.select()
+				.from(outcomes)
+				.where(eq(outcomes.marketId, marketId));
+
+			const outcomeIds = marketOutcomes.map((o) => o.id);
+
+			// 3. Get all orders for this market
+			const marketOrders = await tx
+				.select()
+				.from(orders)
+				.where(eq(orders.marketId, marketId));
+
+			if (marketOrders.length === 0) {
+				return { executions: [] };
+			}
+
+			// 4. Get all positions for this market
+			const marketPositions = await tx
+				.select()
+				.from(positions)
+				.where(eq(positions.marketId, marketId));
+
+			// Convert to exchange types
+			const orderData: Order[] = marketOrders.map((o) => ({
+				id: o.id,
+				userId: o.userId,
+				marketId: o.marketId,
+				outcomeId: o.outcomeId,
+				direction: o.direction as Direction,
+				quantity: o.quantity,
+				price: o.price,
+				escrowAmount: o.escrowAmount,
+			}));
+
+			const positionData: Position[] = marketPositions.map((p) => ({
+				userId: p.userId,
+				marketId: p.marketId,
+				holdings: JSON.parse(p.holdings),
+			}));
+
+			// 5. Run matching algorithm
+			const matchResult = executeMatching(
+				orderData,
+				positionData,
+				outcomeIds,
+				marketId,
+			);
+
+			// 6. Apply balance updates
+			for (const update of matchResult.balanceUpdates) {
+				await tx
+					.update(users)
+					.set({
+						balance: sql`${users.balance} + ${update.balanceDelta}`,
+						locked: sql`${users.locked} + ${update.lockedDelta}`,
+					})
+					.where(eq(users.discordId, update.userId));
+			}
+
+			// 7. Apply position updates
+			const positionUpdatesMap = new Map<string, Map<string, number>>();
+			for (const update of matchResult.positionUpdates) {
+				const key = `${update.userId}:${marketId}`;
+				if (!positionUpdatesMap.has(key)) {
+					positionUpdatesMap.set(key, new Map());
+				}
+				const outcomeMap = positionUpdatesMap.get(key);
+				if (outcomeMap) {
+					const current = outcomeMap.get(update.outcomeId) ?? 0;
+					outcomeMap.set(update.outcomeId, current + update.quantityDelta);
+				}
+			}
+
+			for (const [key, outcomeMap] of positionUpdatesMap) {
+				const [posUserId] = key.split(":");
+
+				// Get existing position or create new one
+				const [existingPos] = await tx
+					.select()
+					.from(positions)
+					.where(
+						and(
+							eq(positions.userId, posUserId),
+							eq(positions.marketId, marketId),
+						),
+					);
+
+				const holdings: Record<string, number> = existingPos
+					? JSON.parse(existingPos.holdings)
+					: {};
+
+				// Apply updates
+				for (const [outcomeId, delta] of outcomeMap) {
+					holdings[outcomeId] = (holdings[outcomeId] ?? 0) + delta;
+					if (holdings[outcomeId] === 0) {
+						delete holdings[outcomeId];
+					}
+				}
+
+				if (existingPos) {
+					await tx
+						.update(positions)
+						.set({
+							holdings: JSON.stringify(holdings),
+							updatedAt: sql`now()`,
+						})
+						.where(eq(positions.id, existingPos.id));
+				} else {
+					await tx.insert(positions).values({
+						id: generateId(),
+						userId: posUserId,
+						marketId,
+						holdings: JSON.stringify(holdings),
+					});
+				}
+			}
+
+			// 8. Apply order updates
+			for (const update of matchResult.orderUpdates) {
+				if (update.newQuantity === 0) {
+					// Delete fully filled order and unlock remaining escrow
+					const [order] = await tx
+						.select()
+						.from(orders)
+						.where(eq(orders.id, update.orderId));
+
+					if (order) {
+						await tx.delete(orders).where(eq(orders.id, update.orderId));
+					}
+				} else {
+					// Update order quantity
+					await tx
+						.update(orders)
+						.set({ quantity: update.newQuantity })
+						.where(eq(orders.id, update.orderId));
+				}
+			}
+
+			// 9. Record executions
+			for (const execution of matchResult.executions) {
+				await tx.insert(executions).values({
+					id: execution.id,
+					marketId: execution.marketId,
+					participants: JSON.stringify(execution.participants),
+				});
+			}
+
+			return { executions: matchResult.executions };
+		});
+	});
+}
+
+// ============================================================================
+// Resolution functions
+// ============================================================================
+
+export interface PayoutInfo {
+	userId: string;
+	shares: number;
+	payout: number;
+}
+
+export interface ResolveMarketResult {
+	market: MarketRecord;
+	payouts: PayoutInfo[];
+	totalPayout: number;
+	winnerCount: number;
+}
+
 export async function resolveMarket(
-	marketId: number,
-	resolution: string,
+	marketId: string,
+	winningOutcomeId: string,
 ): Promise<ResolveMarketResult | null> {
 	return withDbSpan("transaction", "markets", async () => {
 		return db.transaction(async (tx) => {
-			// 1. Update market status (only if still open to prevent double-resolution)
+			// 1. Verify outcome exists and belongs to market
+			const [outcome] = await tx
+				.select()
+				.from(outcomes)
+				.where(
+					and(
+						eq(outcomes.id, winningOutcomeId),
+						eq(outcomes.marketId, marketId),
+					),
+				);
+
+			if (!outcome) {
+				return null;
+			}
+
+			// 2. Update market status (only if still open)
 			const [updatedMarket] = await tx
 				.update(markets)
 				.set({
 					status: "resolved",
-					resolution,
+					winningOutcomeId,
 					resolvedAt: sql`now()`,
 				})
 				.where(and(eq(markets.id, marketId), eq(markets.status, "open")))
@@ -546,53 +1127,55 @@ export async function resolveMarket(
 				return null;
 			}
 
-			// 2. Get all winning positions (shares of the winning outcome)
-			const winningPositions = await tx
-				.select({
-					userId: positions.userId,
-					shares: positions.shares,
-				})
+			// 3. Cancel all outstanding orders and refund escrow
+			const marketOrders = await tx
+				.select()
+				.from(orders)
+				.where(eq(orders.marketId, marketId));
+
+			for (const order of marketOrders) {
+				await tx
+					.update(users)
+					.set({ locked: sql`${users.locked} - ${order.escrowAmount}` })
+					.where(eq(users.discordId, order.userId));
+			}
+
+			await tx.delete(orders).where(eq(orders.marketId, marketId));
+
+			// 4. Get all positions and calculate payouts
+			const marketPositions = await tx
+				.select()
 				.from(positions)
-				.where(
-					and(
-						eq(positions.marketId, marketId),
-						eq(positions.outcome, resolution),
-						gt(positions.shares, 0),
-					),
-				);
+				.where(eq(positions.marketId, marketId));
 
-			logger.info("Queried winning positions", {
-				marketId,
-				resolution,
-				winningPositionsCount: winningPositions.length,
-				winningPositions: winningPositions.map((p) => ({
-					userId: p.userId,
-					shares: p.shares,
-				})),
-			});
-
-			// 3. Calculate and process payouts (1 coin per share)
 			const payouts: PayoutInfo[] = [];
 			let totalPayout = 0;
 
-			for (const position of winningPositions) {
-				const payout = position.shares; // 1 coin per share
-				payouts.push({
-					userId: position.userId,
-					shares: position.shares,
-					payout,
-				});
-				totalPayout += payout;
+			for (const position of marketPositions) {
+				const holdings: Record<string, number> = JSON.parse(position.holdings);
+				const payout = calculatePayout(holdings, winningOutcomeId);
 
-				// Credit user balance
-				await tx
-					.insert(users)
-					.values({ discordId: position.userId, balance: payout })
-					.onConflictDoUpdate({
-						target: users.discordId,
-						set: { balance: sql`${users.balance} + ${payout}` },
+				if (payout > 0) {
+					payouts.push({
+						userId: position.userId,
+						shares: payout,
+						payout,
 					});
+					totalPayout += payout;
+
+					// Credit user balance
+					await tx
+						.insert(users)
+						.values({ discordId: position.userId, balance: payout, locked: 0 })
+						.onConflictDoUpdate({
+							target: users.discordId,
+							set: { balance: sql`${users.balance} + ${payout}` },
+						});
+				}
 			}
+
+			// 5. Delete all positions for this market
+			await tx.delete(positions).where(eq(positions.marketId, marketId));
 
 			return {
 				market: updatedMarket,
@@ -601,374 +1184,5 @@ export async function resolveMarket(
 				winnerCount: payouts.length,
 			};
 		});
-	});
-}
-
-// Pool management functions
-
-export type MarketPoolRecord = typeof marketPools.$inferSelect;
-
-export async function getMarketPool(
-	marketId: number,
-): Promise<MarketPoolRecord | null> {
-	return withDbSpan("select", "market_pools", async () => {
-		const [pool] = await db
-			.select()
-			.from(marketPools)
-			.where(eq(marketPools.marketId, marketId));
-
-		return pool ?? null;
-	});
-}
-
-export async function getMarketPrices(
-	marketId: number,
-): Promise<Record<string, number> | null> {
-	const pool = await getMarketPool(marketId);
-	if (!pool) return null;
-
-	const poolState = parsePoolState(pool.outcomeShares, pool.liquidity);
-	return getAllPrices(poolState);
-}
-
-// Trading functions
-
-export interface TradeResult {
-	success: boolean;
-	shares: number;
-	cost: number;
-	newPrice: number;
-	error?: string;
-}
-
-export async function buyShares(
-	marketId: number,
-	userId: string,
-	outcome: string,
-	shares: number,
-): Promise<TradeResult> {
-	return withDbSpan("transaction", "positions", async () => {
-		return db.transaction(async (tx) => {
-			// 1. Get market and verify it's open
-			const [market] = await tx
-				.select()
-				.from(markets)
-				.where(eq(markets.id, marketId));
-
-			if (!market || market.status !== "open") {
-				return {
-					success: false,
-					shares: 0,
-					cost: 0,
-					newPrice: 0,
-					error: "Market not open",
-				};
-			}
-
-			// 2. Get pool state
-			const [pool] = await tx
-				.select()
-				.from(marketPools)
-				.where(eq(marketPools.marketId, marketId));
-
-			if (!pool) {
-				return {
-					success: false,
-					shares: 0,
-					cost: 0,
-					newPrice: 0,
-					error: "Pool not found",
-				};
-			}
-
-			const poolState = parsePoolState(pool.outcomeShares, pool.liquidity);
-
-			// Validate outcome exists
-			if (!(outcome in poolState.outcomeShares)) {
-				return {
-					success: false,
-					shares: 0,
-					cost: 0,
-					newPrice: 0,
-					error: "Invalid outcome",
-				};
-			}
-
-			// 3. Calculate cost
-			const cost = calculateBuyCost(poolState, outcome, shares);
-
-			// 4. Check user balance
-			const [user] = await tx
-				.select({ balance: users.balance })
-				.from(users)
-				.where(eq(users.discordId, userId));
-
-			const balance = user?.balance ?? 0;
-			if (balance < cost) {
-				return {
-					success: false,
-					shares: 0,
-					cost: 0,
-					newPrice: 0,
-					error: `Insufficient balance. Need ${cost}, have ${balance}`,
-				};
-			}
-
-			// 5. Deduct user balance
-			await tx
-				.update(users)
-				.set({ balance: sql`${users.balance} - ${cost}` })
-				.where(eq(users.discordId, userId));
-
-			// 6. Update pool state
-			poolState.outcomeShares[outcome] += shares;
-			await tx
-				.update(marketPools)
-				.set({
-					outcomeShares: serializeOutcomeShares(poolState.outcomeShares),
-					updatedAt: sql`now()`,
-				})
-				.where(eq(marketPools.marketId, marketId));
-
-			// 7. Upsert position
-			const [existingPosition] = await tx
-				.select()
-				.from(positions)
-				.where(
-					and(
-						eq(positions.marketId, marketId),
-						eq(positions.userId, userId),
-						eq(positions.outcome, outcome),
-					),
-				);
-
-			if (existingPosition) {
-				// Update with weighted average cost basis
-				const totalShares = existingPosition.shares + shares;
-				const totalCost =
-					existingPosition.avgCostBasis * existingPosition.shares + cost;
-				const newAvgCostBasis = Math.ceil(totalCost / totalShares);
-
-				await tx
-					.update(positions)
-					.set({
-						shares: totalShares,
-						avgCostBasis: newAvgCostBasis,
-						updatedAt: sql`now()`,
-					})
-					.where(eq(positions.id, existingPosition.id));
-			} else {
-				await tx.insert(positions).values({
-					marketId,
-					userId,
-					outcome,
-					shares,
-					avgCostBasis: Math.ceil(cost / shares),
-				});
-				logger.info("Created new position", {
-					marketId,
-					userId,
-					outcome,
-					shares,
-				});
-			}
-
-			// 8. Record trade
-			await tx.insert(trades).values({
-				marketId,
-				userId,
-				outcome,
-				tradeType: "buy",
-				shares,
-				price: cost,
-			});
-
-			const newPrice = getPrice(poolState, outcome);
-
-			return { success: true, shares, cost, newPrice };
-		});
-	});
-}
-
-export async function sellShares(
-	marketId: number,
-	userId: string,
-	outcome: string,
-	shares: number,
-): Promise<TradeResult> {
-	return withDbSpan("transaction", "positions", async () => {
-		return db.transaction(async (tx) => {
-			// 1. Verify market is open
-			const [market] = await tx
-				.select()
-				.from(markets)
-				.where(eq(markets.id, marketId));
-
-			if (!market || market.status !== "open") {
-				return {
-					success: false,
-					shares: 0,
-					cost: 0,
-					newPrice: 0,
-					error: "Market not open",
-				};
-			}
-
-			// 2. Get user's position
-			const [position] = await tx
-				.select()
-				.from(positions)
-				.where(
-					and(
-						eq(positions.marketId, marketId),
-						eq(positions.userId, userId),
-						eq(positions.outcome, outcome),
-					),
-				);
-
-			if (!position || position.shares < shares) {
-				return {
-					success: false,
-					shares: 0,
-					cost: 0,
-					newPrice: 0,
-					error: `Insufficient shares. Have ${position?.shares ?? 0}`,
-				};
-			}
-
-			// 3. Get pool and calculate proceeds
-			const [pool] = await tx
-				.select()
-				.from(marketPools)
-				.where(eq(marketPools.marketId, marketId));
-
-			if (!pool) {
-				return {
-					success: false,
-					shares: 0,
-					cost: 0,
-					newPrice: 0,
-					error: "Pool not found",
-				};
-			}
-
-			const poolState = parsePoolState(pool.outcomeShares, pool.liquidity);
-			const proceeds = calculateSellProceeds(poolState, outcome, shares);
-
-			// 4. Update pool state
-			poolState.outcomeShares[outcome] -= shares;
-			await tx
-				.update(marketPools)
-				.set({
-					outcomeShares: serializeOutcomeShares(poolState.outcomeShares),
-					updatedAt: sql`now()`,
-				})
-				.where(eq(marketPools.marketId, marketId));
-
-			// 5. Update position
-			const newShares = position.shares - shares;
-			if (newShares === 0) {
-				await tx.delete(positions).where(eq(positions.id, position.id));
-			} else {
-				await tx
-					.update(positions)
-					.set({ shares: newShares, updatedAt: sql`now()` })
-					.where(eq(positions.id, position.id));
-			}
-
-			// 6. Credit user balance
-			await tx
-				.insert(users)
-				.values({ discordId: userId, balance: proceeds })
-				.onConflictDoUpdate({
-					target: users.discordId,
-					set: { balance: sql`${users.balance} + ${proceeds}` },
-				});
-
-			// 7. Record trade
-			await tx.insert(trades).values({
-				marketId,
-				userId,
-				outcome,
-				tradeType: "sell",
-				shares,
-				price: proceeds,
-			});
-
-			const newPrice = getPrice(poolState, outcome);
-
-			return { success: true, shares, cost: proceeds, newPrice };
-		});
-	});
-}
-
-// Position query functions
-
-export interface UserPosition {
-	marketId: number;
-	marketDescription: string;
-	marketStatus: string;
-	outcome: string;
-	shares: number;
-	avgCostBasis: number;
-	currentPrice: number;
-}
-
-export async function getUserPositions(
-	userId: string,
-	guildId?: string,
-): Promise<UserPosition[]> {
-	return withDbSpan("select", "positions", async () => {
-		const conditions = [eq(positions.userId, userId)];
-		if (guildId) {
-			conditions.push(eq(markets.guildId, guildId));
-		}
-
-		const userPositions = await db
-			.select({
-				marketId: positions.marketId,
-				outcome: positions.outcome,
-				shares: positions.shares,
-				avgCostBasis: positions.avgCostBasis,
-				marketDescription: markets.description,
-				marketStatus: markets.status,
-				guildId: markets.guildId,
-			})
-			.from(positions)
-			.innerJoin(markets, eq(positions.marketId, markets.id))
-			.where(and(...conditions));
-
-		// Get current prices for each market
-		const result: UserPosition[] = [];
-		for (const pos of userPositions) {
-			const pool = await getMarketPool(pos.marketId);
-			if (pool) {
-				const poolState = parsePoolState(pool.outcomeShares, pool.liquidity);
-				const currentPrice = getPrice(poolState, pos.outcome);
-				result.push({
-					marketId: pos.marketId,
-					marketDescription: pos.marketDescription,
-					marketStatus: pos.marketStatus,
-					outcome: pos.outcome,
-					shares: pos.shares,
-					avgCostBasis: pos.avgCostBasis,
-					currentPrice: Math.round(currentPrice * 100), // Convert to percentage
-				});
-			}
-		}
-
-		return result;
-	});
-}
-
-export async function getGuildOpenMarkets(
-	guildId: string,
-): Promise<MarketRecord[]> {
-	return withDbSpan("select", "markets", async () => {
-		return db
-			.select()
-			.from(markets)
-			.where(and(eq(markets.guildId, guildId), eq(markets.status, "open")))
-			.orderBy(desc(markets.createdAt));
 	});
 }

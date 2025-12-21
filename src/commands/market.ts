@@ -19,18 +19,22 @@ import {
 	UserSelectMenuBuilder,
 } from "discord.js";
 import {
-	type MarketRecord,
-	buyShares,
+	type MarketWithOutcomes,
+	type OutcomeRecord,
+	cancelOrder,
 	createMarket,
+	createOrder,
+	executeMarket,
 	getGuildMarketsPaginated,
 	getGuildOpenMarkets,
 	getMarket,
-	getMarketPrices,
+	getMarketOrders,
 	getOracleOpenMarkets,
+	getUserMarketsWithOrders,
 	getUserPositions,
 	resolveMarket,
-	sellShares,
 } from "../database.js";
+import type { Direction } from "../exchange.js";
 import { logger } from "../telemetry/logger.js";
 
 const PAGE_SIZE = 5;
@@ -83,8 +87,8 @@ export const data = new SlashCommandBuilder()
 	)
 	.addSubcommand((subcommand) =>
 		subcommand
-			.setName("buy")
-			.setDescription("Buy shares in a market outcome")
+			.setName("order")
+			.setDescription("Place a limit order in a market")
 			.addStringOption((option) =>
 				option
 					.setName("market")
@@ -95,54 +99,58 @@ export const data = new SlashCommandBuilder()
 			.addStringOption((option) =>
 				option
 					.setName("outcome")
-					.setDescription("Outcome to buy (Yes/No or option name)")
+					.setDescription("Select the outcome to bet on")
 					.setRequired(true)
 					.setAutocomplete(true),
 			)
+			.addStringOption((option) =>
+				option
+					.setName("direction")
+					.setDescription("Buy or sell")
+					.setRequired(true)
+					.addChoices(
+						{ name: "Buy", value: "buy" },
+						{ name: "Sell", value: "sell" },
+					),
+			)
 			.addIntegerOption((option) =>
 				option
-					.setName("shares")
-					.setDescription("Number of shares to buy")
+					.setName("quantity")
+					.setDescription("Number of contracts")
 					.setRequired(true)
 					.setMinValue(1)
 					.setMaxValue(1000),
+			)
+			.addNumberOption((option) =>
+				option
+					.setName("price")
+					.setDescription("Price per contract (0.01 to 0.99)")
+					.setRequired(true)
+					.setMinValue(0.01)
+					.setMaxValue(0.99),
 			),
 	)
 	.addSubcommand((subcommand) =>
 		subcommand
-			.setName("sell")
-			.setDescription("Sell shares back to the market")
+			.setName("cancel")
+			.setDescription("Cancel your active order in a market")
 			.addStringOption((option) =>
 				option
 					.setName("market")
 					.setDescription("Select the market")
 					.setRequired(true)
 					.setAutocomplete(true),
-			)
-			.addStringOption((option) =>
-				option
-					.setName("outcome")
-					.setDescription("Outcome to sell")
-					.setRequired(true)
-					.setAutocomplete(true),
-			)
-			.addIntegerOption((option) =>
-				option
-					.setName("shares")
-					.setDescription("Number of shares to sell")
-					.setRequired(true)
-					.setMinValue(1),
 			),
 	)
 	.addSubcommand((subcommand) =>
 		subcommand
 			.setName("positions")
-			.setDescription("View your positions in markets"),
+			.setDescription("View your positions and orders in markets"),
 	)
 	.addSubcommand((subcommand) =>
 		subcommand
 			.setName("view")
-			.setDescription("View a specific market with current prices")
+			.setDescription("View a specific market with order book")
 			.addStringOption((option) =>
 				option
 					.setName("market")
@@ -153,7 +161,7 @@ export const data = new SlashCommandBuilder()
 	);
 
 function buildMarketsListEmbed(
-	markets: MarketRecord[],
+	markets: MarketWithOutcomes[],
 	page: number,
 	totalCount: number,
 ): EmbedBuilder {
@@ -169,11 +177,12 @@ function buildMarketsListEmbed(
 					m.description.length > 80
 						? `${m.description.slice(0, 77)}...`
 						: m.description;
+				const outcomesList = m.outcomes.map((o) => o.description).join(", ");
 				const statusText =
-					m.status === "resolved" && m.resolution
-						? `Resolved (${m.resolution})`
+					m.status === "resolved" && m.winningOutcomeId
+						? "Resolved"
 						: m.status.charAt(0).toUpperCase() + m.status.slice(1);
-				return `**#${m.id}** ${truncatedDesc}\nOracle: <@${m.oracleId}> | Status: ${statusText}`;
+				return `**#${m.number}** ${truncatedDesc}\nOutcomes: ${outcomesList}\nOracle: <@${m.oracleUserId}> | Status: ${statusText}`;
 			})
 			.join("\n\n");
 	}
@@ -293,10 +302,10 @@ export async function execute(
 		} else if (subcommand === "multi") {
 			await interaction.showModal(buildMultiModal());
 		}
-	} else if (subcommand === "buy") {
-		await handleBuy(interaction);
-	} else if (subcommand === "sell") {
-		await handleSell(interaction);
+	} else if (subcommand === "order") {
+		await handleOrder(interaction);
+	} else if (subcommand === "cancel") {
+		await handleCancel(interaction);
 	} else if (subcommand === "positions") {
 		await handlePositions(interaction);
 	} else if (subcommand === "view") {
@@ -344,17 +353,7 @@ export async function execute(
 			return;
 		}
 
-		const marketIdStr = interaction.options.getString("market", true);
-		const marketId = Number.parseInt(marketIdStr, 10);
-
-		if (Number.isNaN(marketId)) {
-			await interaction.reply({
-				content: "Invalid market selection.",
-				flags: MessageFlags.Ephemeral,
-			});
-			return;
-		}
-
+		const marketId = interaction.options.getString("market", true);
 		const market = await getMarket(marketId);
 
 		if (!market) {
@@ -365,7 +364,7 @@ export async function execute(
 			return;
 		}
 
-		if (market.oracleId !== interaction.user.id) {
+		if (market.oracleUserId !== interaction.user.id) {
 			await interaction.reply({
 				content: "You are not the oracle for this market.",
 				flags: MessageFlags.Ephemeral,
@@ -381,13 +380,10 @@ export async function execute(
 			return;
 		}
 
-		const options =
-			market.outcomeType === "binary"
-				? [
-						{ label: "Yes", value: "Yes" },
-						{ label: "No", value: "No" },
-					]
-				: (market.options ?? []).map((opt) => ({ label: opt, value: opt }));
+		const options = market.outcomes.map((o) => ({
+			label: o.description,
+			value: o.id,
+		}));
 
 		const selectMenu = new StringSelectMenuBuilder()
 			.setCustomId(`market:resolve:${market.id}`)
@@ -402,10 +398,10 @@ export async function execute(
 			.setTitle("Resolve Market")
 			.setDescription(market.description)
 			.addFields(
-				{ name: "Market ID", value: `#${market.id}`, inline: true },
+				{ name: "Market #", value: `${market.number}`, inline: true },
 				{
-					name: "Type",
-					value: market.outcomeType === "binary" ? "Yes/No" : "Multiple Choice",
+					name: "Outcomes",
+					value: market.outcomes.map((o) => o.description).join(", "),
 					inline: true,
 				},
 			);
@@ -425,7 +421,7 @@ function parseOptions(optionsInput: string): string[] {
 		.filter((opt) => opt.length > 0);
 }
 
-async function handleBuy(
+async function handleOrder(
 	interaction: ChatInputCommandInteraction,
 ): Promise<void> {
 	if (!interaction.guildId) {
@@ -436,57 +432,84 @@ async function handleBuy(
 		return;
 	}
 
-	const marketIdStr = interaction.options.getString("market", true);
-	const marketId = Number.parseInt(marketIdStr, 10);
-	const outcome = interaction.options.getString("outcome", true);
-	const shares = interaction.options.getInteger("shares", true);
+	const marketId = interaction.options.getString("market", true);
+	const outcomeId = interaction.options.getString("outcome", true);
+	const direction = interaction.options.getString(
+		"direction",
+		true,
+	) as Direction;
+	const quantity = interaction.options.getInteger("quantity", true);
+	const price = interaction.options.getNumber("price", true);
 
-	if (Number.isNaN(marketId)) {
+	// Get market for display
+	const market = await getMarket(marketId);
+	if (!market) {
 		await interaction.reply({
-			content: "Invalid market selection.",
+			content: "Market not found.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
 	}
 
-	// Execute buy
-	const result = await buyShares(
-		marketId,
+	const outcome = market.outcomes.find((o) => o.id === outcomeId);
+	if (!outcome) {
+		await interaction.reply({
+			content: "Outcome not found.",
+			flags: MessageFlags.Ephemeral,
+		});
+		return;
+	}
+
+	// Create the order
+	const result = await createOrder(
 		interaction.user.id,
-		outcome,
-		shares,
+		marketId,
+		outcomeId,
+		direction,
+		quantity,
+		price,
 	);
 
 	if (!result.success) {
 		await interaction.reply({
-			content: result.error ?? "Failed to buy shares.",
+			content: result.error ?? "Failed to create order.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
 	}
 
-	const market = await getMarket(marketId);
+	// Run matching engine
+	const execResult = await executeMarket(marketId);
 
 	const embed = new EmbedBuilder()
-		.setTitle("Shares Purchased")
-		.setColor(0x00ff00)
-		.setDescription(market?.description ?? `Market #${marketId}`)
+		.setTitle("Order Placed")
+		.setColor(direction === "buy" ? 0x00ff00 : 0xff9900)
+		.setDescription(market.description)
 		.addFields(
-			{ name: "Outcome", value: outcome, inline: true },
-			{ name: "Shares", value: `${shares}`, inline: true },
-			{ name: "Total Cost", value: `${result.cost} coins`, inline: true },
+			{ name: "Market #", value: `${market.number}`, inline: true },
+			{ name: "Outcome", value: outcome.description, inline: true },
+			{ name: "Direction", value: direction.toUpperCase(), inline: true },
+			{ name: "Quantity", value: `${quantity}`, inline: true },
+			{ name: "Price", value: `${(price * 100).toFixed(0)}%`, inline: true },
 			{
-				name: "Price per Share",
-				value: `${result.newPrice.toFixed(2)} coins`,
+				name: "Escrow",
+				value: `${result.order?.escrowAmount.toFixed(2)} coins`,
 				inline: true,
 			},
 		)
 		.setTimestamp();
+
+	if (execResult.executions.length > 0) {
+		embed.addFields({
+			name: "Matched!",
+			value: `${execResult.executions.length} execution(s) occurred`,
+		});
+	}
 
 	await interaction.reply({ embeds: [embed] });
 }
 
-async function handleSell(
+async function handleCancel(
 	interaction: ChatInputCommandInteraction,
 ): Promise<void> {
 	if (!interaction.guildId) {
@@ -497,54 +520,35 @@ async function handleSell(
 		return;
 	}
 
-	const marketIdStr = interaction.options.getString("market", true);
-	const marketId = Number.parseInt(marketIdStr, 10);
-	const outcome = interaction.options.getString("outcome", true);
-	const shares = interaction.options.getInteger("shares", true);
+	const marketId = interaction.options.getString("market", true);
 
-	if (Number.isNaN(marketId)) {
+	const market = await getMarket(marketId);
+	if (!market) {
 		await interaction.reply({
-			content: "Invalid market selection.",
+			content: "Market not found.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
 	}
 
-	// Execute sell
-	const result = await sellShares(
-		marketId,
-		interaction.user.id,
-		outcome,
-		shares,
-	);
+	const result = await cancelOrder(interaction.user.id, marketId);
 
 	if (!result.success) {
 		await interaction.reply({
-			content: result.error ?? "Failed to sell shares.",
+			content: result.error ?? "Failed to cancel order.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
 	}
 
-	const market = await getMarket(marketId);
-
 	const embed = new EmbedBuilder()
-		.setTitle("Shares Sold")
-		.setColor(0xff9900)
-		.setDescription(market?.description ?? `Market #${marketId}`)
-		.addFields(
-			{ name: "Outcome", value: outcome, inline: true },
-			{ name: "Shares", value: `${shares}`, inline: true },
-			{ name: "Proceeds", value: `${result.cost} coins`, inline: true },
-			{
-				name: "Price per Share",
-				value: `${result.newPrice.toFixed(2)} coins`,
-				inline: true,
-			},
-		)
+		.setTitle("Order Cancelled")
+		.setColor(0x888888)
+		.setDescription(market.description)
+		.addFields({ name: "Market #", value: `${market.number}`, inline: true })
 		.setTimestamp();
 
-	await interaction.reply({ embeds: [embed] });
+	await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 async function handlePositions(
@@ -557,17 +561,21 @@ async function handlePositions(
 
 	if (positions.length === 0) {
 		await interaction.reply({
-			content: "You have no positions in any markets.",
+			content: "You have no positions or orders in any markets.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
 	}
 
 	const positionLines = positions.map((p) => {
-		const totalCost = p.shares * p.avgCostBasis;
-		const currentValue = Math.round((p.shares * p.currentPrice) / 100);
-		const pnl = currentValue - totalCost;
-		const pnlStr = pnl >= 0 ? `+${pnl}` : `${pnl}`;
+		const holdingsText = Object.entries(p.holdings)
+			.map(([outcomeId, qty]) => `${qty} contracts`)
+			.join(", ");
+
+		const orderText = p.order
+			? `\nOrder: ${p.order.direction.toUpperCase()} ${p.order.quantity} @ ${(p.order.price * 100).toFixed(0)}%`
+			: "";
+
 		const statusEmoji = p.marketStatus === "open" ? "" : " (resolved)";
 
 		const truncatedDesc =
@@ -575,7 +583,7 @@ async function handlePositions(
 				? `${p.marketDescription.slice(0, 37)}...`
 				: p.marketDescription;
 
-		return `**#${p.marketId}** ${truncatedDesc}${statusEmoji}\n${p.outcome}: ${p.shares} shares @ ${p.avgCostBasis}c avg | Now: ${p.currentPrice}% (${pnlStr}c)`;
+		return `**#${p.marketNumber}** ${truncatedDesc}${statusEmoji}\nHoldings: ${holdingsText || "None"}${orderText}`;
 	});
 
 	const embed = new EmbedBuilder()
@@ -597,18 +605,9 @@ async function handleView(
 		return;
 	}
 
-	const marketIdStr = interaction.options.getString("market", true);
-	const marketId = Number.parseInt(marketIdStr, 10);
-
-	if (Number.isNaN(marketId)) {
-		await interaction.reply({
-			content: "Invalid market selection.",
-			flags: MessageFlags.Ephemeral,
-		});
-		return;
-	}
-
+	const marketId = interaction.options.getString("market", true);
 	const market = await getMarket(marketId);
+
 	if (!market) {
 		await interaction.reply({
 			content: "Market not found.",
@@ -617,52 +616,83 @@ async function handleView(
 		return;
 	}
 
-	const prices = await getMarketPrices(marketId);
+	// Get order book
+	const marketOrders = await getMarketOrders(marketId);
 
-	const pricesText = prices
-		? Object.entries(prices)
-				.map(([outcome, price]) => `${outcome}: ${Math.round(price * 100)}%`)
-				.join("\n")
-		: "N/A";
+	// Group orders by outcome
+	const ordersByOutcome = new Map<
+		string,
+		{ buys: typeof marketOrders; sells: typeof marketOrders }
+	>();
+	for (const outcome of market.outcomes) {
+		ordersByOutcome.set(outcome.id, { buys: [], sells: [] });
+	}
+	for (const order of marketOrders) {
+		const group = ordersByOutcome.get(order.outcomeId);
+		if (group) {
+			if (order.direction === "buy") {
+				group.buys.push(order);
+			} else {
+				group.sells.push(order);
+			}
+		}
+	}
+
+	// Build order book display
+	const orderBookLines: string[] = [];
+	for (const outcome of market.outcomes) {
+		const group = ordersByOutcome.get(outcome.id);
+		if (!group) continue;
+
+		// Sort buys by price descending, sells by price ascending
+		group.buys.sort((a, b) => b.price - a.price);
+		group.sells.sort((a, b) => a.price - b.price);
+
+		const bestBuy = group.buys[0];
+		const bestSell = group.sells[0];
+
+		const buyText = bestBuy
+			? `${bestBuy.quantity} @ ${(bestBuy.price * 100).toFixed(0)}%`
+			: "—";
+		const sellText = bestSell
+			? `${bestSell.quantity} @ ${(bestSell.price * 100).toFixed(0)}%`
+			: "—";
+
+		orderBookLines.push(
+			`**${outcome.description}**\nBest Bid: ${buyText} | Best Ask: ${sellText}`,
+		);
+	}
 
 	const embed = new EmbedBuilder()
-		.setTitle(`Market #${marketId}`)
+		.setTitle(`Market #${market.number}`)
 		.setDescription(market.description)
 		.addFields(
-			{ name: "Oracle", value: `<@${market.oracleId}>`, inline: true },
-			{
-				name: "Type",
-				value: market.outcomeType === "binary" ? "Yes/No" : "Multiple Choice",
-				inline: true,
-			},
+			{ name: "Oracle", value: `<@${market.oracleUserId}>`, inline: true },
 			{
 				name: "Status",
-				value:
-					market.status === "resolved"
-						? `Resolved: ${market.resolution}`
-						: "Open",
+				value: market.status === "resolved" ? "Resolved" : "Open",
 				inline: true,
 			},
-			{ name: "Current Prices", value: pricesText },
+			{ name: "Order Book", value: orderBookLines.join("\n\n") || "No orders" },
 		)
 		.setTimestamp();
 
-	// Add buy buttons for quick access if market is open
-	if (market.status === "open" && prices) {
-		const outcomes = Object.keys(prices);
-		const row = new ActionRowBuilder<ButtonBuilder>();
+	// Add quick order buttons if market is open
+	if (market.status === "open") {
+		const rows: ActionRowBuilder<ButtonBuilder>[] = [];
 
-		for (const outcome of outcomes.slice(0, 5)) {
-			// Max 5 buttons per row
-			row.addComponents(
+		// Create a row for each outcome (max 5 outcomes per market due to button limits)
+		for (const outcome of market.outcomes.slice(0, 5)) {
+			const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
 				new ButtonBuilder()
-					.setCustomId(`market:quickbuy:${marketId}:${outcome}`)
-					.setLabel(`Buy ${outcome} (${Math.round(prices[outcome] * 100)}%)`)
+					.setCustomId(`market:quickorder:${market.id}:${outcome.id}`)
+					.setLabel(`Order: ${outcome.description}`)
 					.setStyle(ButtonStyle.Primary),
 			);
+			rows.push(row);
 		}
 
-		await interaction.reply({ embeds: [embed], components: [row] });
+		await interaction.reply({ embeds: [embed], components: rows });
 	} else {
 		await interaction.reply({ embeds: [embed] });
 	}
@@ -698,18 +728,24 @@ export async function handleMarketModalSubmit(
 			const market = await createMarket({
 				guildId: interaction.guildId,
 				creatorId: interaction.user.id,
-				oracleId,
+				oracleUserId: oracleId,
 				description,
-				outcomeType: "binary",
+				outcomeDescriptions: ["Yes", "No"],
 			});
 
 			const embed = new EmbedBuilder()
 				.setTitle("Market Created")
 				.setDescription(description)
 				.addFields(
-					{ name: "Market ID", value: `#${market.id}`, inline: true },
+					{ name: "Market #", value: `${market.number}`, inline: true },
 					{ name: "Type", value: "Yes/No", inline: true },
 					{ name: "Oracle", value: `<@${oracleId}>`, inline: true },
+					{
+						name: "Outcomes",
+						value: market.outcomes
+							.map((o) => `${o.number}. ${o.description}`)
+							.join("\n"),
+					},
 					{ name: "Status", value: "Open", inline: true },
 				)
 				.setTimestamp();
@@ -744,22 +780,23 @@ export async function handleMarketModalSubmit(
 			const market = await createMarket({
 				guildId: interaction.guildId,
 				creatorId: interaction.user.id,
-				oracleId,
+				oracleUserId: oracleId,
 				description,
-				outcomeType: "multi",
-				options,
+				outcomeDescriptions: options,
 			});
 
 			const embed = new EmbedBuilder()
 				.setTitle("Market Created")
 				.setDescription(description)
 				.addFields(
-					{ name: "Market ID", value: `#${market.id}`, inline: true },
+					{ name: "Market #", value: `${market.number}`, inline: true },
 					{ name: "Type", value: "Multiple Choice", inline: true },
 					{ name: "Oracle", value: `<@${oracleId}>`, inline: true },
 					{
-						name: "Options",
-						value: options.map((opt, i) => `${i + 1}. ${opt}`).join("\n"),
+						name: "Outcomes",
+						value: market.outcomes
+							.map((o) => `${o.number}. ${o.description}`)
+							.join("\n"),
 					},
 					{ name: "Status", value: "Open", inline: true },
 				)
@@ -827,13 +864,12 @@ export async function handleMarketAutocomplete(
 	try {
 		if (focusedOption.name === "outcome") {
 			// Autocomplete for outcome selection
-			const marketIdStr = interaction.options.getString("market");
-			if (!marketIdStr) {
+			const marketId = interaction.options.getString("market");
+			if (!marketId) {
 				await interaction.respond([]);
 				return;
 			}
 
-			const marketId = Number.parseInt(marketIdStr, 10);
 			const market = await getMarket(marketId);
 
 			if (!market) {
@@ -841,38 +877,36 @@ export async function handleMarketAutocomplete(
 				return;
 			}
 
-			const outcomes =
-				market.outcomeType === "binary"
-					? ["Yes", "No"]
-					: (market.options ?? []);
-
-			const prices = await getMarketPrices(marketId);
-
 			const focusedValue = focusedOption.value.toLowerCase();
-			const options = outcomes
-				.filter((outcome) => outcome.toLowerCase().includes(focusedValue))
+			const options = market.outcomes
+				.filter((outcome) =>
+					outcome.description.toLowerCase().includes(focusedValue),
+				)
 				.map((outcome) => ({
-					name: prices
-						? `${outcome} (${Math.round(prices[outcome] * 100)}%)`
-						: outcome,
-					value: outcome,
+					name: outcome.description,
+					value: outcome.id,
 				}));
 
 			await interaction.respond(options);
 		} else if (focusedOption.name === "market") {
 			const focusedValue = focusedOption.value.toLowerCase();
 
-			// For resolve command, show only oracle's markets
-			// For buy/sell/view, show all open markets in the guild
-			let marketsToShow: MarketRecord[];
+			let marketsToShow: MarketWithOutcomes[];
 
 			if (subcommand === "resolve") {
+				// For resolve, show only oracle's markets
 				marketsToShow = await getOracleOpenMarkets(
 					interaction.guildId,
 					interaction.user.id,
 				);
+			} else if (subcommand === "cancel") {
+				// For cancel, show only markets where user has an order
+				marketsToShow = await getUserMarketsWithOrders(
+					interaction.user.id,
+					interaction.guildId,
+				);
 			} else {
-				// buy, sell, view - show all open markets
+				// order, view - show all open markets
 				marketsToShow = await getGuildOpenMarkets(interaction.guildId);
 			}
 
@@ -885,8 +919,8 @@ export async function handleMarketAutocomplete(
 							? `${m.description.slice(0, 77)}...`
 							: m.description;
 					return {
-						name: `#${m.id} - ${truncatedDesc}`,
-						value: m.id.toString(),
+						name: `#${m.number} - ${truncatedDesc}`,
+						value: m.id,
 					};
 				});
 
@@ -909,15 +943,7 @@ export async function handleMarketResolveSelect(
 ): Promise<void> {
 	// Parse custom ID: market:resolve:{marketId}
 	const parts = interaction.customId.split(":");
-	const marketId = Number.parseInt(parts[2], 10);
-
-	if (Number.isNaN(marketId)) {
-		await interaction.reply({
-			content: "Invalid market selection.",
-			flags: MessageFlags.Ephemeral,
-		});
-		return;
-	}
+	const marketId = parts[2];
 
 	const market = await getMarket(marketId);
 
@@ -929,7 +955,7 @@ export async function handleMarketResolveSelect(
 		return;
 	}
 
-	if (market.oracleId !== interaction.user.id) {
+	if (market.oracleUserId !== interaction.user.id) {
 		await interaction.reply({
 			content: "You are not the oracle for this market.",
 			flags: MessageFlags.Ephemeral,
@@ -945,13 +971,13 @@ export async function handleMarketResolveSelect(
 		return;
 	}
 
-	const selectedValue = interaction.values[0];
+	const selectedOutcomeId = interaction.values[0];
 
-	// Validate the resolution is a valid option
-	const validOptions =
-		market.outcomeType === "binary" ? ["Yes", "No"] : (market.options ?? []);
-
-	if (!validOptions.includes(selectedValue)) {
+	// Validate the outcome belongs to this market
+	const selectedOutcome = market.outcomes.find(
+		(o) => o.id === selectedOutcomeId,
+	);
+	if (!selectedOutcome) {
 		await interaction.reply({
 			content: "Invalid resolution option.",
 			flags: MessageFlags.Ephemeral,
@@ -960,7 +986,7 @@ export async function handleMarketResolveSelect(
 	}
 
 	try {
-		const result = await resolveMarket(marketId, selectedValue);
+		const result = await resolveMarket(marketId, selectedOutcomeId);
 
 		if (!result) {
 			await interaction.reply({
@@ -979,7 +1005,7 @@ export async function handleMarketResolveSelect(
 		} else if (winnerCount <= 5) {
 			// Show individual payouts for small number of winners
 			payoutSummary = payouts
-				.map((p) => `<@${p.userId}>: ${p.payout} coins (${p.shares} shares)`)
+				.map((p) => `<@${p.userId}>: ${p.payout} coins (${p.shares} contracts)`)
 				.join("\n");
 		} else {
 			// Summarize for many winners
@@ -997,9 +1023,13 @@ export async function handleMarketResolveSelect(
 			.setColor(0x00ff00)
 			.setDescription(resolved.description)
 			.addFields(
-				{ name: "Market ID", value: `#${resolved.id}`, inline: true },
-				{ name: "Winning Outcome", value: selectedValue, inline: true },
-				{ name: "Oracle", value: `<@${resolved.oracleId}>`, inline: true },
+				{ name: "Market #", value: `${resolved.number}`, inline: true },
+				{
+					name: "Winning Outcome",
+					value: selectedOutcome.description,
+					inline: true,
+				},
+				{ name: "Oracle", value: `<@${resolved.oracleUserId}>`, inline: true },
 				{ name: "Winners", value: `${winnerCount}`, inline: true },
 				{ name: "Total Payout", value: `${totalPayout} coins`, inline: true },
 				{ name: "Payouts", value: payoutSummary },
@@ -1028,17 +1058,112 @@ export async function handleMarketResolveSelect(
 	}
 }
 
-export async function handleMarketQuickBuyButton(
+export async function handleMarketQuickOrderButton(
 	interaction: ButtonInteraction,
 ): Promise<void> {
-	// Parse custom ID: market:quickbuy:{marketId}:{outcome}
+	// Parse custom ID: market:quickorder:{marketId}:{outcomeId}
 	const parts = interaction.customId.split(":");
-	const marketId = Number.parseInt(parts[2], 10);
-	const outcome = parts[3];
+	const marketId = parts[2];
+	const outcomeId = parts[3];
 
-	if (Number.isNaN(marketId) || !outcome) {
+	const market = await getMarket(marketId);
+	if (!market) {
 		await interaction.reply({
-			content: "Invalid button data.",
+			content: "Market not found.",
+			flags: MessageFlags.Ephemeral,
+		});
+		return;
+	}
+
+	const outcome = market.outcomes.find((o) => o.id === outcomeId);
+	if (!outcome) {
+		await interaction.reply({
+			content: "Outcome not found.",
+			flags: MessageFlags.Ephemeral,
+		});
+		return;
+	}
+
+	// Show a modal to get order details
+	const modal = new ModalBuilder()
+		.setCustomId(`market:quickorder:confirm:${marketId}:${outcomeId}`)
+		.setTitle(`Order: ${outcome.description}`);
+
+	const directionInput = new TextInputBuilder()
+		.setCustomId("direction")
+		.setLabel("Direction (buy or sell)")
+		.setPlaceholder("buy")
+		.setStyle(TextInputStyle.Short)
+		.setRequired(true)
+		.setMinLength(3)
+		.setMaxLength(4);
+
+	const quantityInput = new TextInputBuilder()
+		.setCustomId("quantity")
+		.setLabel("Quantity (1-1000)")
+		.setPlaceholder("e.g., 10")
+		.setStyle(TextInputStyle.Short)
+		.setRequired(true)
+		.setMinLength(1)
+		.setMaxLength(4);
+
+	const priceInput = new TextInputBuilder()
+		.setCustomId("price")
+		.setLabel("Price (0.01-0.99)")
+		.setPlaceholder("e.g., 0.50")
+		.setStyle(TextInputStyle.Short)
+		.setRequired(true)
+		.setMinLength(1)
+		.setMaxLength(4);
+
+	modal.addComponents(
+		new ActionRowBuilder<TextInputBuilder>().addComponents(directionInput),
+		new ActionRowBuilder<TextInputBuilder>().addComponents(quantityInput),
+		new ActionRowBuilder<TextInputBuilder>().addComponents(priceInput),
+	);
+
+	await interaction.showModal(modal);
+}
+
+export async function handleMarketQuickOrderModalSubmit(
+	interaction: ModalSubmitInteraction,
+): Promise<void> {
+	// Parse custom ID: market:quickorder:confirm:{marketId}:{outcomeId}
+	const parts = interaction.customId.split(":");
+	const marketId = parts[3];
+	const outcomeId = parts[4];
+
+	const directionStr = interaction.fields
+		.getTextInputValue("direction")
+		.toLowerCase();
+	const quantityStr = interaction.fields.getTextInputValue("quantity");
+	const priceStr = interaction.fields.getTextInputValue("price");
+
+	// Validate direction
+	if (directionStr !== "buy" && directionStr !== "sell") {
+		await interaction.reply({
+			content: "Direction must be 'buy' or 'sell'.",
+			flags: MessageFlags.Ephemeral,
+		});
+		return;
+	}
+	const direction = directionStr as Direction;
+
+	// Validate quantity
+	const quantity = Number.parseInt(quantityStr, 10);
+	if (Number.isNaN(quantity) || quantity < 1 || quantity > 1000) {
+		await interaction.reply({
+			content: "Quantity must be between 1 and 1000.",
+			flags: MessageFlags.Ephemeral,
+		});
+		return;
+	}
+
+	// Validate price
+	const price = Number.parseFloat(priceStr);
+	if (Number.isNaN(price) || price <= 0 || price >= 1) {
+		await interaction.reply({
+			content: "Price must be between 0.01 and 0.99.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
@@ -1053,87 +1178,60 @@ export async function handleMarketQuickBuyButton(
 		return;
 	}
 
-	// Show a modal to get the number of shares
-	const modal = new ModalBuilder()
-		.setCustomId(`market:quickbuy:confirm:${marketId}:${outcome}`)
-		.setTitle(`Buy ${outcome} Shares`);
-
-	const sharesInput = new TextInputBuilder()
-		.setCustomId("shares")
-		.setLabel("Number of shares to buy")
-		.setPlaceholder("e.g., 10")
-		.setStyle(TextInputStyle.Short)
-		.setRequired(true)
-		.setMinLength(1)
-		.setMaxLength(4);
-
-	modal.addComponents(
-		new ActionRowBuilder<TextInputBuilder>().addComponents(sharesInput),
-	);
-
-	await interaction.showModal(modal);
-}
-
-export async function handleMarketQuickBuyModalSubmit(
-	interaction: ModalSubmitInteraction,
-): Promise<void> {
-	// Parse custom ID: market:quickbuy:confirm:{marketId}:{outcome}
-	const parts = interaction.customId.split(":");
-	const marketId = Number.parseInt(parts[3], 10);
-	const outcome = parts[4];
-
-	if (Number.isNaN(marketId) || !outcome) {
+	const outcome = market.outcomes.find((o) => o.id === outcomeId);
+	if (!outcome) {
 		await interaction.reply({
-			content: "Invalid modal data.",
+			content: "Outcome not found.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
 	}
 
-	const sharesStr = interaction.fields.getTextInputValue("shares");
-	const shares = Number.parseInt(sharesStr, 10);
-
-	if (Number.isNaN(shares) || shares < 1 || shares > 1000) {
-		await interaction.reply({
-			content: "Please enter a valid number of shares (1-1000).",
-			flags: MessageFlags.Ephemeral,
-		});
-		return;
-	}
-
-	// Execute buy
-	const result = await buyShares(
-		marketId,
+	// Create the order
+	const result = await createOrder(
 		interaction.user.id,
-		outcome,
-		shares,
+		marketId,
+		outcomeId,
+		direction,
+		quantity,
+		price,
 	);
 
 	if (!result.success) {
 		await interaction.reply({
-			content: result.error ?? "Failed to buy shares.",
+			content: result.error ?? "Failed to create order.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
 	}
 
-	const market = await getMarket(marketId);
+	// Run matching engine
+	const execResult = await executeMarket(marketId);
 
 	const embed = new EmbedBuilder()
-		.setTitle("Shares Purchased")
-		.setColor(0x00ff00)
-		.setDescription(market?.description ?? `Market #${marketId}`)
+		.setTitle("Order Placed")
+		.setColor(direction === "buy" ? 0x00ff00 : 0xff9900)
+		.setDescription(market.description)
 		.addFields(
-			{ name: "Outcome", value: outcome, inline: true },
-			{ name: "Shares", value: `${shares}`, inline: true },
-			{ name: "Total Cost", value: `${result.cost} coins`, inline: true },
+			{ name: "Market #", value: `${market.number}`, inline: true },
+			{ name: "Outcome", value: outcome.description, inline: true },
+			{ name: "Direction", value: direction.toUpperCase(), inline: true },
+			{ name: "Quantity", value: `${quantity}`, inline: true },
+			{ name: "Price", value: `${(price * 100).toFixed(0)}%`, inline: true },
 			{
-				name: "Price per Share",
-				value: `${result.newPrice.toFixed(2)} coins`,
+				name: "Escrow",
+				value: `${result.order?.escrowAmount.toFixed(2)} coins`,
 				inline: true,
 			},
 		)
 		.setTimestamp();
+
+	if (execResult.executions.length > 0) {
+		embed.addFields({
+			name: "Matched!",
+			value: `${execResult.executions.length} execution(s) occurred`,
+		});
+	}
 
 	await interaction.reply({ embeds: [embed] });
 }
