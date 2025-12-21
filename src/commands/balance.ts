@@ -19,17 +19,18 @@ export async function execute(
 	interaction: ChatInputCommandInteraction,
 ): Promise<void> {
 	const targetUser = interaction.options.getUser("user") ?? interaction.user;
-	const balance = await getBalance(targetUser.id);
+	const { balance, locked, available } = await getBalance(targetUser.id);
 
-	if (targetUser.id === interaction.user.id) {
-		await interaction.reply({
-			content: `You have **${balance}** coins.`,
-			flags: MessageFlags.Ephemeral,
-		});
-	} else {
-		await interaction.reply({
-			content: `${targetUser.displayName} has **${balance}** coins.`,
-			flags: MessageFlags.Ephemeral,
-		});
+	const isSelf = targetUser.id === interaction.user.id;
+	const prefix = isSelf ? "You have" : `${targetUser.displayName} has`;
+
+	let content = `${prefix} **${balance.toFixed(0)}** coins.`;
+	if (locked > 0) {
+		content += `\n  Available: **${available.toFixed(0)}** | Locked: **${locked.toFixed(0)}**`;
 	}
+
+	await interaction.reply({
+		content,
+		flags: MessageFlags.Ephemeral,
+	});
 }
