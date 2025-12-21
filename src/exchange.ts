@@ -226,12 +226,65 @@ function findSyntheticMatch(
 }
 
 /**
+ * Find the best direct match for a specific outcome.
+ *
+ * A direct match occurs when a buy order and sell order for the same outcome
+ * have crossing prices (buy price >= sell price). The buyer purchases existing
+ * contracts from the seller.
+ */
+function findDirectMatch(
+	buyOrders: OrderForMatching[],
+	sellOrders: OrderForMatching[],
+): {
+	buyOrder: OrderForMatching;
+	sellOrder: OrderForMatching;
+	matchQuantity: number;
+	matchPrice: number;
+} | null {
+	if (buyOrders.length === 0 || sellOrders.length === 0) {
+		return null;
+	}
+
+	// Sort buys by price descending (highest bid first)
+	buyOrders.sort((a, b) => b.price - a.price);
+	// Sort sells by price ascending (lowest ask first)
+	sellOrders.sort((a, b) => a.price - b.price);
+
+	const bestBuy = buyOrders[0];
+	const bestSell = sellOrders[0];
+
+	// Check if prices cross (buyer willing to pay >= seller's ask)
+	if (bestBuy.price < bestSell.price) {
+		return null; // No match possible
+	}
+
+	// Match at midpoint price (fair split of surplus)
+	const matchPrice = (bestBuy.price + bestSell.price) / 2;
+	const matchQuantity = Math.min(
+		bestBuy.remainingQuantity,
+		bestSell.remainingQuantity,
+	);
+
+	if (matchQuantity === 0) {
+		return null;
+	}
+
+	return {
+		buyOrder: bestBuy,
+		sellOrder: bestSell,
+		matchQuantity,
+		matchPrice,
+	};
+}
+
+/**
  * Main matching algorithm.
  *
  * 1. Collect all buy orders, grouped by outcome
- * 2. Find synthetic matches (bids sum to >= 1.0 across all outcomes)
- * 3. Calculate surplus and distribute pro-rata
- * 4. Update positions and balances
+ * 2. Find direct matches (Buy[A] + Sell[A] where prices cross)
+ * 3. Find synthetic matches (bids sum to >= 1.0 across outcomes)
+ * 4. Calculate surplus and distribute pro-rata
+ * 5. Update positions and balances
  */
 export function executeMatching(
 	orders: Order[],
@@ -330,11 +383,13 @@ export function executeMatching(
 					// Each participant pays their bid price
 					const fillCost = matchQuantity * order.price;
 
-					// The escrowed amount was at original price, all used
+					// The escrowed amount was at original price
 					const escrowUsed = matchQuantity * order.price;
 
-					// Update user balance: deduct escrow (already locked)
-					updateUserBalance(order.userId, 0, -escrowUsed);
+					// Update user balance:
+					// - Deduct the fill cost from balance (actual payment)
+					// - Release the escrow (reduce locked amount)
+					updateUserBalance(order.userId, -fillCost, -escrowUsed);
 
 					// Decrement order quantity
 					order.remainingQuantity -= matchQuantity;
@@ -396,8 +451,113 @@ export function executeMatching(
 			}
 		}
 
-		// TODO: Add direct matching (Buy[A] + Sell[A])
-		// For now, focus on synthetic matching as that's the core innovation
+		// Try to find direct matches (Buy[A] + Sell[A])
+		for (const outcomeId of outcomeIds) {
+			const buyOrders = buyOrdersByOutcome.get(outcomeId) || [];
+			const sellOrders = sellOrdersByOutcome.get(outcomeId) || [];
+
+			const directMatch = findDirectMatch(buyOrders, sellOrders);
+
+			if (directMatch) {
+				matchFound = true;
+				const { buyOrder, sellOrder, matchQuantity, matchPrice } = directMatch;
+
+				// Buyer pays matchPrice per contract
+				const buyerCost = matchQuantity * matchPrice;
+				// Buyer had escrowed at their bid price
+				const buyerEscrowUsed =
+					(matchQuantity / buyOrder.quantity) * buyOrder.escrowAmount;
+				// Buyer gets refund if they escrowed more than needed
+				const buyerRefund = buyerEscrowUsed - buyerCost;
+
+				// Update buyer balance:
+				// - Deduct the actual cost from balance
+				// - Release their escrow
+				// - Add back any refund (if bid was higher than match price)
+				updateUserBalance(
+					buyOrder.userId,
+					-buyerCost + buyerRefund,
+					-buyerEscrowUsed,
+				);
+
+				// Seller receives matchPrice per contract
+				const sellerProceeds = matchQuantity * matchPrice;
+				// Seller had escrowed for short position (if any)
+				const sellerEscrowUsed =
+					(matchQuantity / sellOrder.quantity) * sellOrder.escrowAmount;
+
+				// Update seller balance:
+				// - Add the proceeds to balance
+				// - Release their escrow
+				updateUserBalance(
+					sellOrder.userId,
+					sellerProceeds + sellerEscrowUsed,
+					-sellerEscrowUsed,
+				);
+
+				// Decrement order quantities
+				buyOrder.remainingQuantity -= matchQuantity;
+				sellOrder.remainingQuantity -= matchQuantity;
+
+				// Position updates:
+				// Buyer gains contracts
+				result.positionUpdates.push({
+					userId: buyOrder.userId,
+					outcomeId,
+					quantityDelta: matchQuantity,
+				});
+				// Seller loses contracts (or goes short)
+				result.positionUpdates.push({
+					userId: sellOrder.userId,
+					outcomeId,
+					quantityDelta: -matchQuantity,
+				});
+
+				// Create execution record
+				result.executions.push({
+					id: generateId(),
+					marketId,
+					timestamp: Date.now(),
+					participants: [
+						{
+							userId: buyOrder.userId,
+							outcomeId,
+							quantity: matchQuantity,
+							effectivePrice: matchPrice,
+						},
+						{
+							userId: sellOrder.userId,
+							outcomeId,
+							quantity: -matchQuantity,
+							effectivePrice: matchPrice,
+						},
+					],
+				});
+
+				// Clean up fully filled orders
+				if (buyOrder.remainingQuantity === 0) {
+					const orders = buyOrdersByOutcome.get(outcomeId);
+					if (orders) {
+						buyOrdersByOutcome.set(
+							outcomeId,
+							orders.filter((o) => o.id !== buyOrder.id),
+						);
+					}
+				}
+				if (sellOrder.remainingQuantity === 0) {
+					const orders = sellOrdersByOutcome.get(outcomeId);
+					if (orders) {
+						sellOrdersByOutcome.set(
+							outcomeId,
+							orders.filter((o) => o.id !== sellOrder.id),
+						);
+					}
+				}
+
+				// Break to restart the matching loop (prioritize direct matches)
+				break;
+			}
+		}
 	}
 
 	// Compile order updates
