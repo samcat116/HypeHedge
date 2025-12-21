@@ -22,6 +22,13 @@
       "when": 1765995309900,
       "tag": "0002_spicy_hitman",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1766285686707,
+      "tag": "0003_old_zaladane",
+      "breakpoints": true
     }
   ]
 }
