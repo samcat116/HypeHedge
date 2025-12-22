@@ -8,14 +8,14 @@ RUN bun install --frozen-lockfile --production
 
 # Production image
 FROM base AS release
-COPY --from=install /app/node_modules ./node_modules
-COPY src ./src
-COPY package.json tsconfig.json ./
-COPY drizzle.config.ts ./
-COPY drizzle ./drizzle
+COPY --from=install --chown=bun:bun /app/node_modules ./node_modules
+COPY --chown=bun:bun src ./src
+COPY --chown=bun:bun package.json tsconfig.json ./
+COPY --chown=bun:bun drizzle.config.ts ./
+COPY --chown=bun:bun drizzle ./drizzle
 
 # Create directory for database persistence
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && chown bun:bun /app/data
 
 # Set environment
 ENV NODE_ENV=production
