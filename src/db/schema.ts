@@ -59,7 +59,7 @@ export const backfillProgress = pgTable(
 // Markets table - prediction markets
 export const markets = pgTable("markets", {
 	id: text("id").primaryKey(), // Snowflake ID
-	number: serial("number"), // Auto-incrementing display number
+	number: integer("number").generatedAlwaysAsIdentity(), // Auto-incrementing display number
 	guildId: text("guild_id").notNull(),
 	creatorId: text("creator_id").notNull(),
 	description: text("description").notNull(),
