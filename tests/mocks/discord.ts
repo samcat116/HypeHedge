@@ -1,10 +1,10 @@
-import { vi } from "vitest";
 import type {
 	ButtonInteraction,
 	ChatInputCommandInteraction,
 	MessageReaction,
 	User,
 } from "discord.js";
+import { vi } from "vitest";
 
 export function createMockUser(overrides: Partial<User> = {}): Partial<User> {
 	return {
