@@ -1,7 +1,7 @@
 import {
+	bigint,
 	integer,
 	pgTable,
-	real,
 	serial,
 	text,
 	timestamp,
@@ -11,8 +11,10 @@ import {
 // Users table with locked balance for escrow
 export const users = pgTable("users", {
 	discordId: text("discord_id").primaryKey(),
-	balance: real("balance").notNull().default(0),
-	locked: real("locked").notNull().default(0), // Escrowed funds
+	balanceUnits: bigint("balance_units", { mode: "number" })
+		.notNull()
+		.default(0),
+	lockedUnits: bigint("locked_units", { mode: "number" }).notNull().default(0), // Escrowed funds
 	createdAt: timestamp("created_at", { withTimezone: true })
 		.notNull()
 		.defaultNow(),
@@ -96,9 +98,9 @@ export const orders = pgTable(
 			.notNull()
 			.references(() => outcomes.id),
 		direction: text("direction").notNull(), // 'buy' | 'sell'
-		quantity: integer("quantity").notNull(),
-		price: real("price").notNull(), // 0 < price <= 1
-		escrowAmount: real("escrow_amount").notNull(),
+		quantityUnits: integer("quantity_units").notNull(),
+		priceUnits: integer("price_units").notNull(), // 0 < price < 1, scaled by UNIT_SCALE
+		escrowUnits: bigint("escrow_units", { mode: "number" }).notNull(),
 		createdAt: timestamp("created_at", { withTimezone: true })
 			.notNull()
 			.defaultNow(),
@@ -117,7 +119,7 @@ export const positions = pgTable(
 		marketId: text("market_id")
 			.notNull()
 			.references(() => markets.id),
-		holdings: text("holdings").notNull().default("{}"), // JSON: Record<outcomeId, number>
+		holdings: text("holdings").notNull().default("{}"), // JSON: Record<outcomeId, scaled share units>
 		createdAt: timestamp("created_at", { withTimezone: true })
 			.notNull()
 			.defaultNow(),

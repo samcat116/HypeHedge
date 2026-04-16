@@ -19,6 +19,12 @@ import {
 	UserSelectMenuBuilder,
 } from "discord.js";
 import {
+	formatPriceUnits,
+	formatShareUnits,
+	formatUnits,
+	parsePriceToUnits,
+} from "../accounting.js";
+import {
 	type MarketWithOutcomes,
 	type OutcomeRecord,
 	cancelOrder,
@@ -440,6 +446,15 @@ async function handleOrder(
 	) as Direction;
 	const quantity = interaction.options.getInteger("quantity", true);
 	const price = interaction.options.getNumber("price", true);
+	const priceUnits = parsePriceToUnits(price);
+
+	if (priceUnits === null) {
+		await interaction.reply({
+			content: "Price must be between 0.01 and 0.99 with at most two decimals.",
+			flags: MessageFlags.Ephemeral,
+		});
+		return;
+	}
 
 	// Get market for display
 	const market = await getMarket(marketId);
@@ -467,7 +482,7 @@ async function handleOrder(
 		outcomeId,
 		direction,
 		quantity,
-		price,
+		priceUnits,
 	);
 
 	if (!result.success) {
@@ -490,10 +505,10 @@ async function handleOrder(
 			{ name: "Outcome", value: outcome.description, inline: true },
 			{ name: "Direction", value: direction.toUpperCase(), inline: true },
 			{ name: "Quantity", value: `${quantity}`, inline: true },
-			{ name: "Price", value: `${(price * 100).toFixed(0)}%`, inline: true },
+			{ name: "Price", value: formatPriceUnits(priceUnits), inline: true },
 			{
 				name: "Escrow",
-				value: `${result.order?.escrowAmount.toFixed(2)} coins`,
+				value: `${formatUnits(result.order?.escrowUnits ?? 0)} coins`,
 				inline: true,
 			},
 		)
@@ -569,11 +584,11 @@ async function handlePositions(
 
 	const positionLines = positions.map((p) => {
 		const holdingsText = Object.entries(p.holdings)
-			.map(([outcomeId, qty]) => `${qty} contracts`)
+			.map(([, qtyUnits]) => `${formatShareUnits(qtyUnits)} contracts`)
 			.join(", ");
 
 		const orderText = p.order
-			? `\nOrder: ${p.order.direction.toUpperCase()} ${p.order.quantity} @ ${(p.order.price * 100).toFixed(0)}%`
+			? `\nOrder: ${p.order.direction.toUpperCase()} ${formatShareUnits(p.order.quantityUnits)} @ ${formatPriceUnits(p.order.priceUnits)}`
 			: "";
 
 		const statusEmoji = p.marketStatus === "open" ? "" : " (resolved)";
@@ -645,17 +660,17 @@ async function handleView(
 		if (!group) continue;
 
 		// Sort buys by price descending, sells by price ascending
-		group.buys.sort((a, b) => b.price - a.price);
-		group.sells.sort((a, b) => a.price - b.price);
+		group.buys.sort((a, b) => b.priceUnits - a.priceUnits);
+		group.sells.sort((a, b) => a.priceUnits - b.priceUnits);
 
 		const bestBuy = group.buys[0];
 		const bestSell = group.sells[0];
 
 		const buyText = bestBuy
-			? `${bestBuy.quantity} @ ${(bestBuy.price * 100).toFixed(0)}%`
+			? `${formatShareUnits(bestBuy.quantityUnits)} @ ${formatPriceUnits(bestBuy.priceUnits)}`
 			: "—";
 		const sellText = bestSell
-			? `${bestSell.quantity} @ ${(bestSell.price * 100).toFixed(0)}%`
+			? `${formatShareUnits(bestSell.quantityUnits)} @ ${formatPriceUnits(bestSell.priceUnits)}`
 			: "—";
 
 		orderBookLines.push(
@@ -996,7 +1011,7 @@ export async function handleMarketResolveSelect(
 			return;
 		}
 
-		const { market: resolved, payouts, totalPayout, winnerCount } = result;
+		const { market: resolved, payouts, totalPayoutUnits, winnerCount } = result;
 
 		// Build payout summary
 		let payoutSummary: string;
@@ -1005,15 +1020,18 @@ export async function handleMarketResolveSelect(
 		} else if (winnerCount <= 5) {
 			// Show individual payouts for small number of winners
 			payoutSummary = payouts
-				.map((p) => `<@${p.userId}>: ${p.payout} coins (${p.shares} contracts)`)
+				.map(
+					(p) =>
+						`<@${p.userId}>: ${formatUnits(p.payoutUnits)} coins (${formatShareUnits(p.shareUnits)} contracts)`,
+				)
 				.join("\n");
 		} else {
 			// Summarize for many winners
 			const topPayouts = payouts
-				.sort((a, b) => b.payout - a.payout)
+				.sort((a, b) => b.payoutUnits - a.payoutUnits)
 				.slice(0, 3);
 			payoutSummary = topPayouts
-				.map((p) => `<@${p.userId}>: ${p.payout} coins`)
+				.map((p) => `<@${p.userId}>: ${formatUnits(p.payoutUnits)} coins`)
 				.join("\n");
 			payoutSummary += `\n...and ${winnerCount - 3} more winners`;
 		}
@@ -1031,7 +1049,11 @@ export async function handleMarketResolveSelect(
 				},
 				{ name: "Oracle", value: `<@${resolved.oracleUserId}>`, inline: true },
 				{ name: "Winners", value: `${winnerCount}`, inline: true },
-				{ name: "Total Payout", value: `${totalPayout} coins`, inline: true },
+				{
+					name: "Total Payout",
+					value: `${formatUnits(totalPayoutUnits)} coins`,
+					inline: true,
+				},
 				{ name: "Payouts", value: payoutSummary },
 			)
 			.setTimestamp();
@@ -1161,9 +1183,10 @@ export async function handleMarketQuickOrderModalSubmit(
 
 	// Validate price
 	const price = Number.parseFloat(priceStr);
-	if (Number.isNaN(price) || price <= 0 || price >= 1) {
+	const priceUnits = parsePriceToUnits(price);
+	if (priceUnits === null) {
 		await interaction.reply({
-			content: "Price must be between 0.01 and 0.99.",
+			content: "Price must be between 0.01 and 0.99 with at most two decimals.",
 			flags: MessageFlags.Ephemeral,
 		});
 		return;
@@ -1194,7 +1217,7 @@ export async function handleMarketQuickOrderModalSubmit(
 		outcomeId,
 		direction,
 		quantity,
-		price,
+		priceUnits,
 	);
 
 	if (!result.success) {
@@ -1217,10 +1240,10 @@ export async function handleMarketQuickOrderModalSubmit(
 			{ name: "Outcome", value: outcome.description, inline: true },
 			{ name: "Direction", value: direction.toUpperCase(), inline: true },
 			{ name: "Quantity", value: `${quantity}`, inline: true },
-			{ name: "Price", value: `${(price * 100).toFixed(0)}%`, inline: true },
+			{ name: "Price", value: formatPriceUnits(priceUnits), inline: true },
 			{
 				name: "Escrow",
-				value: `${result.order?.escrowAmount.toFixed(2)} coins`,
+				value: `${formatUnits(result.order?.escrowUnits ?? 0)} coins`,
 				inline: true,
 			},
 		)

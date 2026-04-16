@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { coinsToUnits } from "../../src/accounting.js";
 import {
 	calculateEscrow,
 	calculatePayout,
@@ -6,128 +7,163 @@ import {
 	generateId,
 	validateOrder,
 } from "../../src/exchange.js";
-import { createOrder, outcomeIds } from "../fixtures/market.js";
+import {
+	createOrder,
+	outcomeIds,
+	price,
+	quantity,
+} from "../fixtures/market.js";
 
 describe("exchange", () => {
 	describe("validateOrder", () => {
 		it("should accept valid buy order", () => {
-			const result = validateOrder("buy", 10, 0.5);
+			const result = validateOrder("buy", quantity(10), price(0.5));
 			expect(result).toEqual({ valid: true });
 		});
 
 		it("should accept valid sell order", () => {
-			const result = validateOrder("sell", 5, 0.75);
+			const result = validateOrder("sell", quantity(5), price(0.75));
 			expect(result).toEqual({ valid: true });
 		});
 
 		it("should reject zero quantity", () => {
-			const result = validateOrder("buy", 0, 0.5);
+			const result = validateOrder("buy", 0, price(0.5));
 			expect(result.valid).toBe(false);
 			expect(result.error).toContain("positive integer");
 		});
 
 		it("should reject negative quantity", () => {
-			const result = validateOrder("buy", -5, 0.5);
+			const result = validateOrder("buy", -5, price(0.5));
 			expect(result.valid).toBe(false);
 			expect(result.error).toContain("positive integer");
 		});
 
 		it("should reject non-integer quantity", () => {
-			const result = validateOrder("buy", 5.5, 0.5);
+			const result = validateOrder("buy", 5.5, price(0.5));
 			expect(result.valid).toBe(false);
 			expect(result.error).toContain("positive integer");
 		});
 
 		it("should reject price at 0", () => {
-			const result = validateOrder("buy", 10, 0);
+			const result = validateOrder("buy", quantity(10), 0);
 			expect(result.valid).toBe(false);
 			expect(result.error).toContain("between 0 and 1");
 		});
 
 		it("should reject price at 1", () => {
-			const result = validateOrder("buy", 10, 1);
+			const result = validateOrder("buy", quantity(10), 10000);
 			expect(result.valid).toBe(false);
 			expect(result.error).toContain("between 0 and 1");
 		});
 
 		it("should reject price above 1", () => {
-			const result = validateOrder("buy", 10, 1.5);
+			const result = validateOrder("buy", quantity(10), 15000);
 			expect(result.valid).toBe(false);
 			expect(result.error).toContain("between 0 and 1");
 		});
 
 		it("should reject negative price", () => {
-			const result = validateOrder("buy", 10, -0.5);
+			const result = validateOrder("buy", quantity(10), -5000);
 			expect(result.valid).toBe(false);
 			expect(result.error).toContain("between 0 and 1");
 		});
 
 		it("should accept edge case prices near boundaries", () => {
-			expect(validateOrder("buy", 10, 0.01)).toEqual({ valid: true });
-			expect(validateOrder("buy", 10, 0.99)).toEqual({ valid: true });
+			expect(validateOrder("buy", quantity(10), price(0.01))).toEqual({
+				valid: true,
+			});
+			expect(validateOrder("buy", quantity(10), price(0.99))).toEqual({
+				valid: true,
+			});
 		});
 	});
 
 	describe("calculateEscrow", () => {
 		describe("buy orders", () => {
 			it("should escrow quantity * price for buys", () => {
-				expect(calculateEscrow("buy", 10, 0.5, 0)).toBe(5);
+				expect(calculateEscrow("buy", quantity(10), price(0.5), 0)).toBe(
+					coinsToUnits(5),
+				);
 			});
 
 			it("should ignore currently owned for buys", () => {
-				expect(calculateEscrow("buy", 10, 0.5, 100)).toBe(5);
+				expect(
+					calculateEscrow("buy", quantity(10), price(0.5), quantity(100)),
+				).toBe(coinsToUnits(5));
 			});
 
 			it("should handle low prices", () => {
-				expect(calculateEscrow("buy", 100, 0.01, 0)).toBeCloseTo(1);
+				expect(calculateEscrow("buy", quantity(100), price(0.01), 0)).toBe(
+					coinsToUnits(1),
+				);
 			});
 
 			it("should handle high prices", () => {
-				expect(calculateEscrow("buy", 100, 0.99, 0)).toBeCloseTo(99);
+				expect(calculateEscrow("buy", quantity(100), price(0.99), 0)).toBe(
+					coinsToUnits(99),
+				);
 			});
 		});
 
 		describe("sell orders", () => {
 			it("should escrow nothing when selling all owned contracts", () => {
-				expect(calculateEscrow("sell", 10, 0.7, 10)).toBe(0);
+				expect(
+					calculateEscrow("sell", quantity(10), price(0.7), quantity(10)),
+				).toBe(0);
 			});
 
 			it("should escrow nothing when selling less than owned", () => {
-				expect(calculateEscrow("sell", 10, 0.7, 20)).toBe(0);
+				expect(
+					calculateEscrow("sell", quantity(10), price(0.7), quantity(20)),
+				).toBe(0);
 			});
 
 			it("should escrow (1-price) * quantity for full short positions", () => {
 				// Selling 10 with 0 owned = 10 short at 0.7 price
 				// Escrow = 10 * (1 - 0.7) = 3
-				expect(calculateEscrow("sell", 10, 0.7, 0)).toBeCloseTo(3);
+				expect(calculateEscrow("sell", quantity(10), price(0.7), 0)).toBe(
+					coinsToUnits(3),
+				);
 			});
 
 			it("should escrow partial short when partially owned", () => {
 				// Selling 10, own 4 = 6 short
 				// Escrow = 6 * (1 - 0.5) = 3
-				expect(calculateEscrow("sell", 10, 0.5, 4)).toBe(3);
+				expect(
+					calculateEscrow("sell", quantity(10), price(0.5), quantity(4)),
+				).toBe(coinsToUnits(3));
 			});
 
 			it("should handle high sell price (low escrow for shorts)", () => {
 				// Selling 10 at 0.9 price, own 0 = escrow 10 * 0.1 = 1
-				expect(calculateEscrow("sell", 10, 0.9, 0)).toBeCloseTo(1);
+				expect(calculateEscrow("sell", quantity(10), price(0.9), 0)).toBe(
+					coinsToUnits(1),
+				);
 			});
 
 			it("should handle low sell price (high escrow for shorts)", () => {
 				// Selling 10 at 0.1 price, own 0 = escrow 10 * 0.9 = 9
-				expect(calculateEscrow("sell", 10, 0.1, 0)).toBeCloseTo(9);
+				expect(calculateEscrow("sell", quantity(10), price(0.1), 0)).toBe(
+					coinsToUnits(9),
+				);
 			});
 		});
 	});
 
 	describe("calculatePayout", () => {
 		it("should return holdings of winning outcome", () => {
-			const holdings = { "outcome-yes": 10, "outcome-no": 5 };
-			expect(calculatePayout(holdings, "outcome-yes")).toBe(10);
+			const holdings = {
+				"outcome-yes": quantity(10),
+				"outcome-no": quantity(5),
+			};
+			expect(calculatePayout(holdings, "outcome-yes")).toBe(quantity(10));
 		});
 
 		it("should return 0 for non-winning outcomes", () => {
-			const holdings = { "outcome-yes": 10, "outcome-no": 5 };
+			const holdings = {
+				"outcome-yes": quantity(10),
+				"outcome-no": quantity(5),
+			};
 			expect(calculatePayout(holdings, "outcome-other")).toBe(0);
 		});
 
@@ -136,8 +172,8 @@ describe("exchange", () => {
 		});
 
 		it("should handle negative holdings (short positions)", () => {
-			const holdings = { "outcome-yes": -5 };
-			expect(calculatePayout(holdings, "outcome-yes")).toBe(-5);
+			const holdings = { "outcome-yes": -quantity(5) };
+			expect(calculatePayout(holdings, "outcome-yes")).toBe(-quantity(5));
 		});
 	});
 
@@ -175,7 +211,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.6,
-						escrowAmount: 6,
+						escrow: 6,
 					}),
 					createOrder({
 						id: "order-sell",
@@ -184,7 +220,7 @@ describe("exchange", () => {
 						direction: "sell",
 						quantity: 10,
 						price: 0.4,
-						escrowAmount: 6,
+						escrow: 6,
 					}),
 				];
 
@@ -198,7 +234,7 @@ describe("exchange", () => {
 					expect.objectContaining({
 						userId: "buyer",
 						outcomeId: "outcome-yes",
-						quantityDelta: 10,
+						quantityUnitsDelta: quantity(10),
 					}),
 				);
 
@@ -207,7 +243,7 @@ describe("exchange", () => {
 					expect.objectContaining({
 						userId: "seller",
 						outcomeId: "outcome-yes",
-						quantityDelta: -10,
+						quantityUnitsDelta: -quantity(10),
 					}),
 				);
 			});
@@ -221,7 +257,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.4, // Buyer willing to pay 0.4
-						escrowAmount: 4,
+						escrow: 4,
 					}),
 					createOrder({
 						id: "order-sell",
@@ -230,7 +266,7 @@ describe("exchange", () => {
 						direction: "sell",
 						quantity: 10,
 						price: 0.6, // Seller wants 0.6
-						escrowAmount: 4,
+						escrow: 4,
 					}),
 				];
 
@@ -249,7 +285,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.6,
-						escrowAmount: 6,
+						escrow: 6,
 					}),
 					createOrder({
 						id: "order-sell",
@@ -258,7 +294,7 @@ describe("exchange", () => {
 						direction: "sell",
 						quantity: 5, // Only selling 5
 						price: 0.4,
-						escrowAmount: 3,
+						escrow: 3,
 					}),
 				];
 
@@ -269,13 +305,15 @@ describe("exchange", () => {
 				// Buyer order should have 5 remaining
 				expect(result.orderUpdates).toContainEqual({
 					orderId: "order-buy",
-					newQuantity: 5,
+					newQuantityUnits: quantity(5),
+					newEscrowUnits: coinsToUnits(3),
 				});
 
 				// Seller order fully filled
 				expect(result.orderUpdates).toContainEqual({
 					orderId: "order-sell",
-					newQuantity: 0,
+					newQuantityUnits: 0,
+					newEscrowUnits: 0,
 				});
 			});
 
@@ -288,7 +326,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.7,
-						escrowAmount: 7,
+						escrow: 7,
 					}),
 					createOrder({
 						id: "order-sell",
@@ -297,7 +335,7 @@ describe("exchange", () => {
 						direction: "sell",
 						quantity: 10,
 						price: 0.3,
-						escrowAmount: 7,
+						escrow: 7,
 					}),
 				];
 
@@ -305,7 +343,9 @@ describe("exchange", () => {
 
 				expect(result.executions).toHaveLength(1);
 				// Midpoint = (0.7 + 0.3) / 2 = 0.5
-				expect(result.executions[0].participants[0].effectivePrice).toBe(0.5);
+				expect(result.executions[0].participants[0].effectivePriceUnits).toBe(
+					price(0.5),
+				);
 			});
 		});
 
@@ -319,7 +359,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.6,
-						escrowAmount: 6,
+						escrow: 6,
 					}),
 					createOrder({
 						id: "order-no",
@@ -328,7 +368,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.5,
-						escrowAmount: 5,
+						escrow: 5,
 					}),
 				];
 
@@ -348,7 +388,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.4,
-						escrowAmount: 4,
+						escrow: 4,
 					}),
 					createOrder({
 						id: "order-no",
@@ -357,7 +397,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.4,
-						escrowAmount: 4,
+						escrow: 4,
 					}),
 				];
 
@@ -376,7 +416,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.6,
-						escrowAmount: 6,
+						escrow: 6,
 					}),
 					createOrder({
 						id: "order-no",
@@ -385,7 +425,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 5, // Smaller quantity
 						price: 0.5,
-						escrowAmount: 2.5,
+						escrow: 2.5,
 					}),
 				];
 
@@ -396,11 +436,13 @@ describe("exchange", () => {
 				// Should fill at 5 (minimum of 10 and 5)
 				expect(result.orderUpdates).toContainEqual({
 					orderId: "order-yes",
-					newQuantity: 5, // 10 - 5 = 5 remaining
+					newQuantityUnits: quantity(5), // 10 - 5 = 5 remaining
+					newEscrowUnits: coinsToUnits(3),
 				});
 				expect(result.orderUpdates).toContainEqual({
 					orderId: "order-no",
-					newQuantity: 0, // Fully filled
+					newQuantityUnits: 0, // Fully filled
+					newEscrowUnits: 0,
 				});
 			});
 		});
@@ -426,7 +468,7 @@ describe("exchange", () => {
 						direction: "buy",
 						quantity: 10,
 						price: 0.5,
-						escrowAmount: 5,
+						escrow: 5,
 					}),
 					createOrder({
 						id: "order-sell",
@@ -435,7 +477,7 @@ describe("exchange", () => {
 						direction: "sell",
 						quantity: 10,
 						price: 0.5,
-						escrowAmount: 5,
+						escrow: 5,
 					}),
 				];
 
@@ -454,9 +496,50 @@ describe("exchange", () => {
 				expect(buyerUpdate).toBeDefined();
 				expect(sellerUpdate).toBeDefined();
 
-				// Locked amounts should decrease (escrow released)
-				expect(buyerUpdate?.lockedDelta).toBeLessThan(0);
-				expect(sellerUpdate?.lockedDelta).toBeLessThan(0);
+				expect(buyerUpdate).toEqual({
+					userId: "buyer",
+					balanceUnitsDelta: -coinsToUnits(5),
+					lockedUnitsDelta: -coinsToUnits(5),
+				});
+				expect(sellerUpdate).toEqual({
+					userId: "seller",
+					balanceUnitsDelta: coinsToUnits(5),
+					lockedUnitsDelta: -coinsToUnits(5),
+				});
+			});
+
+			it("should represent half-cent midpoint prices exactly", () => {
+				const orders = [
+					createOrder({
+						id: "order-buy",
+						userId: "buyer",
+						outcomeId: "outcome-yes",
+						direction: "buy",
+						quantity: 10,
+						price: 0.51,
+						escrow: 5.1,
+					}),
+					createOrder({
+						id: "order-sell",
+						userId: "seller",
+						outcomeId: "outcome-yes",
+						direction: "sell",
+						quantity: 10,
+						price: 0.5,
+						escrow: 5,
+					}),
+				];
+
+				const result = executeMatching(orders, [], outcomeIds, marketId);
+
+				expect(result.executions[0].participants[0].effectivePriceUnits).toBe(
+					5050,
+				);
+				expect(result.balanceUpdates).toContainEqual({
+					userId: "buyer",
+					balanceUnitsDelta: -coinsToUnits(5.05),
+					lockedUnitsDelta: -coinsToUnits(5.1),
+				});
 			});
 		});
 	});
