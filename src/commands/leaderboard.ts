@@ -8,6 +8,7 @@ import {
 	MessageFlags,
 	SlashCommandBuilder,
 } from "discord.js";
+import { formatUnits } from "../accounting.js";
 import { getLeaderboardPaginated } from "../database.js";
 import {
 	leaderboardPageViewsCounter,
@@ -21,7 +22,7 @@ export const data = new SlashCommandBuilder()
 	.setDescription("View the top reaction currency earners");
 
 function buildLeaderboardEmbed(
-	entries: { discord_id: string; balance: number; rank: number }[],
+	entries: { discord_id: string; balanceUnits: number; rank: number }[],
 	page: number,
 	totalCount: number,
 ): EmbedBuilder {
@@ -30,7 +31,10 @@ function buildLeaderboardEmbed(
 	const description =
 		entries.length > 0
 			? entries
-					.map((e) => `**${e.rank}.** <@${e.discord_id}> - ${e.balance} coins`)
+					.map(
+						(e) =>
+							`**${e.rank}.** <@${e.discord_id}> - ${formatUnits(e.balanceUnits)} coins`,
+					)
 					.join("\n")
 			: "No one has earned any coins yet!";
 

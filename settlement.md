@@ -229,3 +229,76 @@ interface Exchange {
   resolveMarket(marketId: Snowflake, outcomeId: Snowflake): MarketResolution;
 }
 ```
+
+
+## Fixed-precision implementation and rollout review
+
+Accounting uses 10,000 integer units per coin, contract, and unit price. Public
+commands accept whole contracts and cent prices. Values exposed as JavaScript
+numbers must stay within `Number.MAX_SAFE_INTEGER`; multiplication and division
+use BigInt intermediates, and database constraints reject out-of-range scalar
+amounts. The schema snapshot includes the P2P tables and accounting constraints.
+
+Balances include locked funds; escrow is a reservation rather than a second cash
+account. Buy partial fills retain conservatively rounded remaining escrow. Direct
+cash transfers round down to the currency unit and credit exactly the amount
+debited. Synthetic matches fund exactly one unit per minted share; largest
+remainders allocate cash and complementary shares without losing or creating
+units. Allocation ties use stable participant order. A tiny synthetic fill stays
+on the book when rounding cannot preserve collateral for remaining orders.
+New execution participants record `balanceUnitsDelta` as the exact cash movement;
+`effectivePriceUnits` is a rounded display price. Legacy history omits the cash
+field, since exact historical transfers cannot be recovered from rounded prices.
+
+Short sells fund the unowned portion as complete baskets. The buyer receives the
+sold outcome; the seller retains each other outcome and pays the basket cost
+less sale proceeds. Existing owned contracts transfer normally. This avoids
+negative active holdings and gives either winner a fully backed payout. Remaining
+sell escrow covers the remaining short quantity, including partially owned sells.
+Market mutations serialize on the market row; reservations and multi-user cash
+updates lock users in a consistent order. Reaction removal reclaims only available
+funds and processes duplicate removal events once.
+
+Before rollout, review these rounding and basket-short policies. The existing
+matcher still selects one best order per outcome rather than sharing equal-price
+fills pro-rata across all tied orders; this PR does not redesign that selection.
+Use `bun install --frozen-lockfile`, `bun run lint`, `bun run typecheck`, and
+`TEST_DATABASE_URL=postgres://...@127.0.0.1:<fixture-port>/<fixture-db> bun run test`.
+The integration tests require loopback PostgreSQL and create and drop only a
+randomized fixture schema. CI supplies a disposable PostgreSQL 17 service.
+The obsolete npm lockfile described the former SQLite dependency set; Bun's lock
+is the source of truth.
+
+Migration 0006 must run once through the transactional migration runner, with bot
+writers stopped. Rehearse on a disposable restored backup and reconcile balances,
+order escrow, and JSON holdings before approving any real migration. It fails
+atomically for negative historical holdings, unsafe or malformed values, missing
+order users, uncovered locks, or locks that differ from summed order escrow.
+Legacy partial-fill escrow drift and independent float rounding may require an
+explicit reconciliation decision; the migration never guesses a repair. Inspect
+large REAL values carefully: precision already lost before migration is not
+recoverable by scaling. This migration cannot be safely reversed by dividing
+values after new accounting writes; rollback needs the pre-migration backup and
+matching old application version. Application and schema changes require a
+coordinated rollout. PR validation uses fixtures only and does not authorize a
+real-data migration or deployment.
+
+
+### Production workflow authorization
+
+Merging to main runs verification CI only. Fly deployment and container image
+publishing accept only manual `workflow_dispatch` events on main, with the
+`rollout_approved` boolean explicitly enabled. Its default is false; a push,
+unapproved dispatch, or dispatch from another branch cannot run either job.
+
+Approval to merge this accounting change does not approve a real migration,
+image publication, or deployment. First authorize and rehearse the migration on
+a disposable restored backup; reconcile legacy accounting, stop bot writers,
+prepare a tested backup rollback, and coordinate the schema/application switch.
+Then obtain explicit authorization for each production action and approved main
+commit. An authorized operator can use the GitHub Actions Run workflow UI on
+main and enable `rollout_approved` for Release or Deploy to Fly.io as appropriate.
+Verify main still points to the approved commit before dispatch. Neither workflow
+performs a database migration, so it must be completed and verified separately
+before deploying the new application. Do not dispatch these workflows as part of
+PR verification or the merge itself.

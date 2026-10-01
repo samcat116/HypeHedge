@@ -1,4 +1,13 @@
-import { and, desc, eq, gt, lt, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
+import {
+	type PriceUnits,
+	type ShareUnits,
+	UNIT_SCALE,
+	addUnits,
+	contractsToShareUnits,
+	formatUnits,
+	parseHoldings,
+} from "./accounting.js";
 import { db } from "./db";
 import {
 	backfillProgress,
@@ -20,6 +29,7 @@ import {
 	calculatePayout,
 	executeMatching,
 	generateId,
+	validateOrder,
 } from "./exchange.js";
 import { withSpan } from "./telemetry/index.js";
 import { logger } from "./telemetry/logger.js";
@@ -94,10 +104,14 @@ export async function addReaction(
 			await withDbSpan("upsert", "users", async () => {
 				await db
 					.insert(users)
-					.values({ discordId: authorId, balance: 1, locked: 0 })
+					.values({
+						discordId: authorId,
+						balanceUnits: UNIT_SCALE,
+						lockedUnits: 0,
+					})
 					.onConflictDoUpdate({
 						target: users.discordId,
-						set: { balance: sql`${users.balance} + 1` },
+						set: { balanceUnits: sql`${users.balanceUnits} + ${UNIT_SCALE}` },
 					});
 			});
 			return true;
@@ -112,63 +126,58 @@ export async function removeReaction(
 	emoji: string,
 ): Promise<boolean> {
 	return withDbSpan("delete", "reactions", async () => {
-		// Get reaction to find author
-		const [reaction] = await db
-			.select({ authorId: reactions.authorId })
-			.from(reactions)
-			.where(
-				and(
-					eq(reactions.messageId, messageId),
-					eq(reactions.reactorId, reactorId),
-					eq(reactions.emoji, emoji),
-				),
-			);
-
-		if (!reaction) return false;
-
-		// Delete reaction
-		await db
-			.delete(reactions)
-			.where(
-				and(
-					eq(reactions.messageId, messageId),
-					eq(reactions.reactorId, reactorId),
-					eq(reactions.emoji, emoji),
-				),
-			);
-
-		// Decrement balance
-		await withDbSpan("update", "users", async () => {
-			await db
-				.update(users)
-				.set({ balance: sql`${users.balance} - 1` })
+		return db.transaction(async (tx) => {
+			const [reaction] = await tx
+				.delete(reactions)
 				.where(
-					and(eq(users.discordId, reaction.authorId), gt(users.balance, 0)),
-				);
+					and(
+						eq(reactions.messageId, messageId),
+						eq(reactions.reactorId, reactorId),
+						eq(reactions.emoji, emoji),
+					),
+				)
+				.returning({ authorId: reactions.authorId });
+			if (!reaction) return false;
+			// Reclaim spendable funds without making balances negative or
+			// removing collateral that still backs resting orders.
+			await tx
+				.update(users)
+				.set({
+					balanceUnits: sql`GREATEST(${users.lockedUnits}, ${users.balanceUnits} - ${UNIT_SCALE})`,
+				})
+				.where(eq(users.discordId, reaction.authorId));
+			return true;
 		});
-
-		return true;
 	});
 }
 
-export async function getBalance(
-	userId: string,
-): Promise<{ balance: number; locked: number; available: number }> {
+export async function getBalance(userId: string): Promise<{
+	balanceUnits: number;
+	lockedUnits: number;
+	availableUnits: number;
+}> {
 	return withDbSpan("select", "users", async () => {
 		const [user] = await db
-			.select({ balance: users.balance, locked: users.locked })
+			.select({
+				balanceUnits: users.balanceUnits,
+				lockedUnits: users.lockedUnits,
+			})
 			.from(users)
 			.where(eq(users.discordId, userId));
 
-		const balance = user?.balance ?? 0;
-		const locked = user?.locked ?? 0;
-		return { balance, locked, available: balance - locked };
+		const balanceUnits = user?.balanceUnits ?? 0;
+		const lockedUnits = user?.lockedUnits ?? 0;
+		return {
+			balanceUnits,
+			lockedUnits,
+			availableUnits: balanceUnits - lockedUnits,
+		};
 	});
 }
 
 export interface LeaderboardEntry {
 	discord_id: string;
-	balance: number;
+	balanceUnits: number;
 	rank: number;
 }
 
@@ -177,14 +186,14 @@ export async function getLeaderboard(limit = 10): Promise<LeaderboardEntry[]> {
 		const results = await db
 			.select({
 				discord_id: users.discordId,
-				balance: users.balance,
+				balanceUnits: users.balanceUnits,
 			})
 			.from(users)
-			.where(gt(users.balance, 0))
-			.orderBy(desc(users.balance))
+			.where(gt(users.balanceUnits, 0))
+			.orderBy(desc(users.balanceUnits))
 			.limit(limit);
 
-		return results.map((r, i) => ({ ...r, balance: r.balance, rank: i + 1 }));
+		return results.map((r, i) => ({ ...r, rank: i + 1 }));
 	});
 }
 
@@ -205,23 +214,22 @@ export async function getLeaderboardPaginated(
 			db
 				.select({
 					discord_id: users.discordId,
-					balance: users.balance,
+					balanceUnits: users.balanceUnits,
 				})
 				.from(users)
-				.where(gt(users.balance, 0))
-				.orderBy(desc(users.balance))
+				.where(gt(users.balanceUnits, 0))
+				.orderBy(desc(users.balanceUnits))
 				.limit(pageSize)
 				.offset(offset),
 			db
 				.select({ count: sql<number>`count(*)` })
 				.from(users)
-				.where(gt(users.balance, 0)),
+				.where(gt(users.balanceUnits, 0)),
 		]);
 
 		const totalCount = Number(countResult[0]?.count ?? 0);
 		const entries = results.map((r, i) => ({
 			...r,
-			balance: r.balance,
 			rank: offset + i + 1,
 		}));
 
@@ -381,10 +389,16 @@ export async function addReactionsBatch(
 			for (const [authorId, count] of authorCounts) {
 				await db
 					.insert(users)
-					.values({ discordId: authorId, balance: count, locked: 0 })
+					.values({
+						discordId: authorId,
+						balanceUnits: count * UNIT_SCALE,
+						lockedUnits: 0,
+					})
 					.onConflictDoUpdate({
 						target: users.discordId,
-						set: { balance: sql`${users.balance} + ${count}` },
+						set: {
+							balanceUnits: sql`${users.balanceUnits} + ${count * UNIT_SCALE}`,
+						},
 					});
 			}
 		});
@@ -623,15 +637,26 @@ export async function createOrder(
 	outcomeId: string,
 	direction: Direction,
 	quantity: number,
-	price: number,
+	priceUnits: PriceUnits,
 ): Promise<CreateOrderResult> {
+	if (
+		!Number.isSafeInteger(quantity) ||
+		quantity <= 0 ||
+		!Number.isSafeInteger(quantity * UNIT_SCALE)
+	) {
+		return {
+			success: false,
+			error: "Quantity must be a positive integer within the supported range",
+		};
+	}
 	return withDbSpan("transaction", "orders", async () => {
 		return db.transaction(async (tx) => {
 			// 1. Verify market is open
 			const [market] = await tx
 				.select()
 				.from(markets)
-				.where(eq(markets.id, marketId));
+				.where(eq(markets.id, marketId))
+				.for("update");
 
 			if (!market || market.status !== "open") {
 				return { success: false, error: "Market not open" };
@@ -671,39 +696,51 @@ export async function createOrder(
 				);
 
 			const holdings: Record<string, number> = position
-				? JSON.parse(position.holdings)
+				? parseHoldings(position.holdings)
 				: {};
-			const currentlyOwned = holdings[outcomeId] ?? 0;
+			const currentlyOwnedUnits = holdings[outcomeId] ?? 0;
+			const quantityUnits = contractsToShareUnits(quantity);
+			const validation = validateOrder(direction, quantityUnits, priceUnits);
+			if (!validation.valid) {
+				return {
+					success: false,
+					error: validation.error ?? "Invalid order",
+				};
+			}
 
 			// 5. Calculate escrow required
-			const escrowAmount = calculateEscrow(
+			const escrowUnits = calculateEscrow(
 				direction,
-				quantity,
-				price,
-				currentlyOwned,
+				quantityUnits,
+				priceUnits,
+				currentlyOwnedUnits,
 			);
 
 			// 6. Check user has sufficient available balance
 			const [user] = await tx
-				.select({ balance: users.balance, locked: users.locked })
+				.select({
+					balanceUnits: users.balanceUnits,
+					lockedUnits: users.lockedUnits,
+				})
 				.from(users)
-				.where(eq(users.discordId, userId));
+				.where(eq(users.discordId, userId))
+				.for("update");
 
-			const balance = user?.balance ?? 0;
-			const locked = user?.locked ?? 0;
-			const available = balance - locked;
+			const balanceUnits = user?.balanceUnits ?? 0;
+			const lockedUnits = user?.lockedUnits ?? 0;
+			const availableUnits = balanceUnits - lockedUnits;
 
-			if (available < escrowAmount) {
+			if (availableUnits < escrowUnits) {
 				return {
 					success: false,
-					error: `Insufficient balance. Need ${escrowAmount.toFixed(2)}, have ${available.toFixed(2)} available`,
+					error: `Insufficient balance. Need ${formatUnits(escrowUnits)}, have ${formatUnits(availableUnits)} available`,
 				};
 			}
 
 			// 7. Lock the escrow amount
 			await tx
 				.update(users)
-				.set({ locked: sql`${users.locked} + ${escrowAmount}` })
+				.set({ lockedUnits: sql`${users.lockedUnits} + ${escrowUnits}` })
 				.where(eq(users.discordId, userId));
 
 			// 8. Create the order
@@ -716,9 +753,9 @@ export async function createOrder(
 					marketId,
 					outcomeId,
 					direction,
-					quantity,
-					price,
-					escrowAmount,
+					quantityUnits,
+					priceUnits,
+					escrowUnits,
 				})
 				.returning();
 
@@ -733,6 +770,11 @@ export async function cancelOrder(
 ): Promise<{ success: boolean; error?: string }> {
 	return withDbSpan("transaction", "orders", async () => {
 		return db.transaction(async (tx) => {
+			await tx
+				.select()
+				.from(markets)
+				.where(eq(markets.id, marketId))
+				.for("update");
 			// 1. Find the order
 			const [order] = await tx
 				.select()
@@ -746,7 +788,7 @@ export async function cancelOrder(
 			// 2. Unlock escrowed funds
 			await tx
 				.update(users)
-				.set({ locked: sql`${users.locked} - ${order.escrowAmount}` })
+				.set({ lockedUnits: sql`${users.lockedUnits} - ${order.escrowUnits}` })
 				.where(eq(users.discordId, userId));
 
 			// 3. Delete the order
@@ -840,7 +882,7 @@ export async function getPosition(
 		return {
 			userId: position.userId,
 			marketId: position.marketId,
-			holdings: JSON.parse(position.holdings),
+			holdings: parseHoldings(position.holdings),
 		};
 	});
 }
@@ -850,7 +892,7 @@ export interface UserPositionView {
 	marketNumber: number;
 	marketDescription: string;
 	marketStatus: string;
-	holdings: Record<string, number>;
+	holdings: Record<string, ShareUnits>;
 	order: OrderRecord | null;
 }
 
@@ -892,7 +934,7 @@ export async function getUserPositions(
 				marketNumber: pos.marketNumber,
 				marketDescription: pos.marketDescription,
 				marketStatus: pos.marketStatus,
-				holdings: JSON.parse(pos.holdings),
+				holdings: parseHoldings(pos.holdings),
 				order: order ?? null,
 			});
 		}
@@ -914,7 +956,8 @@ export async function executeMarket(
 			const [market] = await tx
 				.select()
 				.from(markets)
-				.where(eq(markets.id, marketId));
+				.where(eq(markets.id, marketId))
+				.for("update");
 
 			if (!market || market.status !== "open") {
 				return { executions: [], error: "Market not open" };
@@ -951,15 +994,15 @@ export async function executeMarket(
 				marketId: o.marketId,
 				outcomeId: o.outcomeId,
 				direction: o.direction as Direction,
-				quantity: o.quantity,
-				price: o.price,
-				escrowAmount: o.escrowAmount,
+				quantityUnits: o.quantityUnits,
+				priceUnits: o.priceUnits,
+				escrowUnits: o.escrowUnits,
 			}));
 
 			const positionData: Position[] = marketPositions.map((p) => ({
 				userId: p.userId,
 				marketId: p.marketId,
-				holdings: JSON.parse(p.holdings),
+				holdings: parseHoldings(p.holdings),
 			}));
 
 			// 5. Run matching algorithm
@@ -970,13 +1013,26 @@ export async function executeMarket(
 				marketId,
 			);
 
+			const affectedUsers = matchResult.balanceUpdates.map(
+				(update) => update.userId,
+			);
+			if (affectedUsers.length > 0)
+				await tx
+					.select()
+					.from(users)
+					.where(inArray(users.discordId, affectedUsers))
+					.orderBy(users.discordId)
+					.for("update");
+
 			// 6. Apply balance updates
-			for (const update of matchResult.balanceUpdates) {
+			for (const update of matchResult.balanceUpdates.sort((a, b) =>
+				a.userId.localeCompare(b.userId),
+			)) {
 				await tx
 					.update(users)
 					.set({
-						balance: sql`${users.balance} + ${update.balanceDelta}`,
-						locked: sql`${users.locked} + ${update.lockedDelta}`,
+						balanceUnits: sql`${users.balanceUnits} + ${update.balanceUnitsDelta}`,
+						lockedUnits: sql`${users.lockedUnits} + ${update.lockedUnitsDelta}`,
 					})
 					.where(eq(users.discordId, update.userId));
 			}
@@ -991,7 +1047,10 @@ export async function executeMarket(
 				const outcomeMap = positionUpdatesMap.get(key);
 				if (outcomeMap) {
 					const current = outcomeMap.get(update.outcomeId) ?? 0;
-					outcomeMap.set(update.outcomeId, current + update.quantityDelta);
+					outcomeMap.set(
+						update.outcomeId,
+						addUnits(current, update.quantityUnitsDelta),
+					);
 				}
 			}
 
@@ -1009,13 +1068,13 @@ export async function executeMarket(
 						),
 					);
 
-				const holdings: Record<string, number> = existingPos
-					? JSON.parse(existingPos.holdings)
+				const holdings: Record<string, ShareUnits> = existingPos
+					? parseHoldings(existingPos.holdings)
 					: {};
 
 				// Apply updates
 				for (const [outcomeId, delta] of outcomeMap) {
-					holdings[outcomeId] = (holdings[outcomeId] ?? 0) + delta;
+					holdings[outcomeId] = addUnits(holdings[outcomeId] ?? 0, delta);
 					if (holdings[outcomeId] === 0) {
 						delete holdings[outcomeId];
 					}
@@ -1041,8 +1100,8 @@ export async function executeMarket(
 
 			// 8. Apply order updates
 			for (const update of matchResult.orderUpdates) {
-				if (update.newQuantity === 0) {
-					// Delete fully filled order and unlock remaining escrow
+				if (update.newQuantityUnits === 0) {
+					// Delete fully filled order.
 					const [order] = await tx
 						.select()
 						.from(orders)
@@ -1052,10 +1111,13 @@ export async function executeMarket(
 						await tx.delete(orders).where(eq(orders.id, update.orderId));
 					}
 				} else {
-					// Update order quantity
+					// Update remaining quantity and remaining escrow after a partial fill.
 					await tx
 						.update(orders)
-						.set({ quantity: update.newQuantity })
+						.set({
+							quantityUnits: update.newQuantityUnits,
+							escrowUnits: update.newEscrowUnits,
+						})
 						.where(eq(orders.id, update.orderId));
 				}
 			}
@@ -1080,14 +1142,14 @@ export async function executeMarket(
 
 export interface PayoutInfo {
 	userId: string;
-	shares: number;
-	payout: number;
+	shareUnits: ShareUnits;
+	payoutUnits: number;
 }
 
 export interface ResolveMarketResult {
 	market: MarketRecord;
 	payouts: PayoutInfo[];
-	totalPayout: number;
+	totalPayoutUnits: number;
 	winnerCount: number;
 }
 
@@ -1133,43 +1195,67 @@ export async function resolveMarket(
 				.from(orders)
 				.where(eq(orders.marketId, marketId));
 
+			const marketPositions = await tx
+				.select()
+				.from(positions)
+				.where(eq(positions.marketId, marketId));
+			const affectedUsers = [
+				...new Set([
+					...marketOrders.map((order) => order.userId),
+					...marketPositions.map((position) => position.userId),
+				]),
+			];
+			if (affectedUsers.length > 0)
+				await tx
+					.select()
+					.from(users)
+					.where(inArray(users.discordId, affectedUsers))
+					.orderBy(users.discordId)
+					.for("update");
+
 			for (const order of marketOrders) {
 				await tx
 					.update(users)
-					.set({ locked: sql`${users.locked} - ${order.escrowAmount}` })
+					.set({
+						lockedUnits: sql`${users.lockedUnits} - ${order.escrowUnits}`,
+					})
 					.where(eq(users.discordId, order.userId));
 			}
 
 			await tx.delete(orders).where(eq(orders.marketId, marketId));
 
 			// 4. Get all positions and calculate payouts
-			const marketPositions = await tx
-				.select()
-				.from(positions)
-				.where(eq(positions.marketId, marketId));
 
 			const payouts: PayoutInfo[] = [];
-			let totalPayout = 0;
+			let totalPayoutUnits = 0;
 
 			for (const position of marketPositions) {
-				const holdings: Record<string, number> = JSON.parse(position.holdings);
-				const payout = calculatePayout(holdings, winningOutcomeId);
+				const holdings: Record<string, ShareUnits> = parseHoldings(
+					position.holdings,
+				);
+				const payoutUnits = calculatePayout(holdings, winningOutcomeId);
 
-				if (payout > 0) {
+				if (payoutUnits > 0) {
 					payouts.push({
 						userId: position.userId,
-						shares: payout,
-						payout,
+						shareUnits: payoutUnits,
+						payoutUnits,
 					});
-					totalPayout += payout;
+					totalPayoutUnits = addUnits(totalPayoutUnits, payoutUnits);
 
 					// Credit user balance
 					await tx
 						.insert(users)
-						.values({ discordId: position.userId, balance: payout, locked: 0 })
+						.values({
+							discordId: position.userId,
+							balanceUnits: payoutUnits,
+							lockedUnits: 0,
+						})
 						.onConflictDoUpdate({
 							target: users.discordId,
-							set: { balance: sql`${users.balance} + ${payout}` },
+							set: {
+								balanceUnits: sql`${users.balanceUnits} + ${payoutUnits}`,
+							},
 						});
 				}
 			}
@@ -1180,7 +1266,7 @@ export async function resolveMarket(
 			return {
 				market: updatedMarket,
 				payouts,
-				totalPayout,
+				totalPayoutUnits,
 				winnerCount: payouts.length,
 			};
 		});

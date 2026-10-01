@@ -1,8 +1,13 @@
 name: Release
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rollout_approved:
+        description: Confirm this production action is explicitly authorized after migration and rollback review
+        required: true
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -10,6 +15,7 @@ env:
 
 jobs:
   build-and-push:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.rollout_approved == true
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
     permissions:

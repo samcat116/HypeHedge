@@ -3,6 +3,7 @@ import {
 	MessageFlags,
 	SlashCommandBuilder,
 } from "discord.js";
+import { formatUnits } from "../accounting.js";
 import { getBalance } from "../database.js";
 
 export const data = new SlashCommandBuilder()
@@ -19,14 +20,16 @@ export async function execute(
 	interaction: ChatInputCommandInteraction,
 ): Promise<void> {
 	const targetUser = interaction.options.getUser("user") ?? interaction.user;
-	const { balance, locked, available } = await getBalance(targetUser.id);
+	const { balanceUnits, lockedUnits, availableUnits } = await getBalance(
+		targetUser.id,
+	);
 
 	const isSelf = targetUser.id === interaction.user.id;
 	const prefix = isSelf ? "You have" : `${targetUser.displayName} has`;
 
-	let content = `${prefix} **${balance.toFixed(0)}** coins.`;
-	if (locked > 0) {
-		content += `\n  Available: **${available.toFixed(0)}** | Locked: **${locked.toFixed(0)}**`;
+	let content = `${prefix} **${formatUnits(balanceUnits)}** coins.`;
+	if (lockedUnits > 0) {
+		content += `\n  Available: **${formatUnits(availableUnits)}** | Locked: **${formatUnits(lockedUnits)}**`;
 	}
 
 	await interaction.reply({
