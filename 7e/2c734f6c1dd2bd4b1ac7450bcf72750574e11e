@@ -1,0 +1,26 @@
+.github/workflows/deploy.yml
+  h_a84d4ff76cadd1 4-10,14
+.github/workflows/pr.yml
+  h_a84d4ff76cadd1 4-5
+.github/workflows/release.yml
+  h_a84d4ff76cadd1 4-10,18
+bun.lock
+  h_a84d4ff76cadd1 28,495-496
+package.json
+  h_a84d4ff76cadd1 39-40
+settlement.md
+  h_a84d4ff76cadd1 285-304
+tests/unit/workflows.test.ts
+  h_a84d4ff76cadd1 1-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7e2c734f6c1dd2bd4b1ac7450bcf72750574e11e",
+  "prompts": {},
+  "humans": {
+    "h_a84d4ff76cadd1": {
+      "author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
