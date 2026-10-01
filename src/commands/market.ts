@@ -1172,8 +1172,8 @@ export async function handleMarketQuickOrderModalSubmit(
 	const direction = directionStr as Direction;
 
 	// Validate quantity
-	const quantity = Number.parseInt(quantityStr, 10);
-	if (Number.isNaN(quantity) || quantity < 1 || quantity > 1000) {
+	const quantity = Number(quantityStr);
+	if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) {
 		await interaction.reply({
 			content: "Quantity must be between 1 and 1000.",
 			flags: MessageFlags.Ephemeral,
@@ -1182,7 +1182,7 @@ export async function handleMarketQuickOrderModalSubmit(
 	}
 
 	// Validate price
-	const price = Number.parseFloat(priceStr);
+	const price = Number(priceStr);
 	const priceUnits = parsePriceToUnits(price);
 	if (priceUnits === null) {
 		await interaction.reply({

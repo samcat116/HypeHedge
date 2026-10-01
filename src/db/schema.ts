@@ -1,5 +1,7 @@
+import { sql } from "drizzle-orm";
 import {
 	bigint,
+	check,
 	integer,
 	pgTable,
 	serial,
@@ -9,16 +11,35 @@ import {
 } from "drizzle-orm/pg-core";
 
 // Users table with locked balance for escrow
-export const users = pgTable("users", {
-	discordId: text("discord_id").primaryKey(),
-	balanceUnits: bigint("balance_units", { mode: "number" })
-		.notNull()
-		.default(0),
-	lockedUnits: bigint("locked_units", { mode: "number" }).notNull().default(0), // Escrowed funds
-	createdAt: timestamp("created_at", { withTimezone: true })
-		.notNull()
-		.defaultNow(),
-});
+export const users = pgTable(
+	"users",
+	{
+		discordId: text("discord_id").primaryKey(),
+		balanceUnits: bigint("balance_units", { mode: "number" })
+			.notNull()
+			.default(0),
+		lockedUnits: bigint("locked_units", { mode: "number" })
+			.notNull()
+			.default(0),
+		createdAt: timestamp("created_at", { withTimezone: true })
+			.notNull()
+			.defaultNow(),
+	},
+	(table) => [
+		check(
+			"users_balance_units_nonnegative",
+			sql`${table.balanceUnits} BETWEEN 0 AND 9007199254740991`,
+		),
+		check(
+			"users_locked_units_nonnegative",
+			sql`${table.lockedUnits} BETWEEN 0 AND 9007199254740991`,
+		),
+		check(
+			"users_locked_units_covered",
+			sql`${table.lockedUnits} <= ${table.balanceUnits}`,
+		),
+	],
+);
 
 // Reactions table (unchanged - for the currency earning system)
 export const reactions = pgTable(
@@ -98,7 +119,7 @@ export const orders = pgTable(
 			.notNull()
 			.references(() => outcomes.id),
 		direction: text("direction").notNull(), // 'buy' | 'sell'
-		quantityUnits: integer("quantity_units").notNull(),
+		quantityUnits: bigint("quantity_units", { mode: "number" }).notNull(),
 		priceUnits: integer("price_units").notNull(), // 0 < price < 1, scaled by UNIT_SCALE
 		escrowUnits: bigint("escrow_units", { mode: "number" }).notNull(),
 		createdAt: timestamp("created_at", { withTimezone: true })
@@ -107,6 +128,18 @@ export const orders = pgTable(
 	},
 	(table) => ({
 		uniqueUserMarket: unique().on(table.userId, table.marketId),
+		quantityPositive: check(
+			"orders_quantity_units_positive",
+			sql`${table.quantityUnits} BETWEEN 1 AND 9007199254740991`,
+		),
+		priceRange: check(
+			"orders_price_units_range",
+			sql`${table.priceUnits} > 0 AND ${table.priceUnits} < 10000`,
+		),
+		escrowNonnegative: check(
+			"orders_escrow_units_nonnegative",
+			sql`${table.escrowUnits} BETWEEN 0 AND 9007199254740991`,
+		),
 	}),
 );
 

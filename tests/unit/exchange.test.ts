@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { coinsToUnits } from "../../src/accounting.js";
 import {
+	type Order,
+	type Position,
 	calculateEscrow,
 	calculatePayout,
-	executeMatching,
 	generateId,
+	executeMatching as matchOrders,
 	validateOrder,
 } from "../../src/exchange.js";
 import {
@@ -13,6 +15,22 @@ import {
 	price,
 	quantity,
 } from "../fixtures/market.js";
+
+function executeMatching(
+	orders: Order[],
+	positions: Position[],
+	outcomeIds: string[],
+	marketId: string,
+) {
+	const owned = orders
+		.filter((order) => order.direction === "sell")
+		.map((order) => ({
+			userId: order.userId,
+			marketId,
+			holdings: { [order.outcomeId]: order.quantityUnits },
+		}));
+	return matchOrders(orders, [...owned, ...positions], outcomeIds, marketId);
+}
 
 describe("exchange", () => {
 	describe("validateOrder", () => {

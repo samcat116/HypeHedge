@@ -15,6 +15,8 @@ import {
 	type PriceUnits,
 	type ShareUnits,
 	type UnitAmount,
+	addUnits,
+	allocateUnits,
 	multiplySharesByPrice,
 	prorateShareUnits,
 } from "./accounting.js";
@@ -73,6 +75,8 @@ export interface Party {
 	outcomeId: Snowflake;
 	quantityUnits: ShareUnits;
 	effectivePriceUnits: PriceUnits;
+	/** Exact cash delta for new executions; legacy records may omit it. */
+	balanceUnitsDelta?: UnitAmount;
 }
 
 export interface Execution {
@@ -171,6 +175,7 @@ function findSyntheticMatch(
 	participants: Map<Snowflake, OrderForMatching[]>;
 	participatingOutcomeIds: Snowflake[];
 	totalPriceUnits: PriceUnits;
+	contributions: UnitAmount[];
 } | null {
 	// Sort orders by price descending for each outcome
 	for (const orders of buyOrdersByOutcome.values()) {
@@ -238,11 +243,40 @@ function findSyntheticMatch(
 		return null;
 	}
 
+	const matched = [...participants.values()].flat();
+	const capacities = matched.map((order) =>
+		Math.min(
+			escrowForFill(order, maxQuantityUnits),
+			multiplySharesByPrice(maxQuantityUnits, order.priceUnits, "ceil"),
+		),
+	);
+	// A sub-unit fill can require more currency than can be released while
+	// retaining collateral for remaining orders. Leave it on the book.
+	if (capacities.reduce((sum, value) => sum + value, 0) < maxQuantityUnits)
+		return null;
+	const contributions = allocateUnits(
+		maxQuantityUnits,
+		matched.map((order) => order.priceUnits),
+	);
+	let excess = 0;
+	for (let i = 0; i < contributions.length; i++) {
+		if (contributions[i] > capacities[i]) {
+			excess += contributions[i] - capacities[i];
+			contributions[i] = capacities[i];
+		}
+	}
+	for (let i = 0; i < contributions.length && excess > 0; i++) {
+		const amount = Math.min(excess, capacities[i] - contributions[i]);
+		contributions[i] += amount;
+		excess -= amount;
+	}
+
 	return {
 		matchQuantityUnits: maxQuantityUnits,
 		participants,
 		participatingOutcomeIds,
 		totalPriceUnits,
+		contributions,
 	};
 }
 
@@ -306,19 +340,28 @@ function findDirectMatch(
  * The final fill consumes every leftover escrow unit so rounding never leaves
  * stale locked funds attached to a fully filled order.
  */
+function escrowForFill(
+	order: OrderForMatching,
+	fillQuantityUnits: ShareUnits,
+): UnitAmount {
+	const remaining = order.remainingQuantityUnits - fillQuantityUnits;
+	const reserved =
+		remaining <= 0
+			? 0
+			: prorateShareUnits(
+					order.escrowUnits,
+					remaining,
+					order.quantityUnits,
+					"ceil",
+				);
+	return order.remainingEscrowUnits - reserved;
+}
+
 function consumeEscrow(
 	order: OrderForMatching,
 	fillQuantityUnits: ShareUnits,
 ): UnitAmount {
-	if (fillQuantityUnits >= order.remainingQuantityUnits) {
-		const escrowUnits = order.remainingEscrowUnits;
-		order.remainingEscrowUnits = 0;
-		return escrowUnits;
-	}
-
-	const escrowUnits = Math.round(
-		(order.escrowUnits * fillQuantityUnits) / order.quantityUnits,
-	);
+	const escrowUnits = escrowForFill(order, fillQuantityUnits);
 	order.remainingEscrowUnits -= escrowUnits;
 	return escrowUnits;
 }
@@ -334,7 +377,7 @@ function consumeEscrow(
  */
 export function executeMatching(
 	orders: Order[],
-	_positions: Position[],
+	positions: Position[],
 	outcomeIds: Snowflake[],
 	marketId: Snowflake,
 ): MatchResult {
@@ -344,6 +387,34 @@ export function executeMatching(
 		positionUpdates: [],
 		balanceUpdates: [],
 	};
+
+	const holdings = new Map<Snowflake, Record<Snowflake, ShareUnits>>();
+	for (const position of positions) {
+		for (const amount of Object.values(position.holdings)) {
+			if (!Number.isSafeInteger(amount) || amount < 0)
+				throw new Error(
+					"Legacy short or unsafe holdings require reconciliation",
+				);
+		}
+		holdings.set(position.userId, { ...position.holdings });
+	}
+	function updatePosition(
+		userId: Snowflake,
+		outcomeId: Snowflake,
+		delta: ShareUnits,
+	) {
+		const current = holdings.get(userId) ?? {};
+		current[outcomeId] = addUnits(current[outcomeId] ?? 0, delta);
+		if (!Number.isSafeInteger(current[outcomeId]) || current[outcomeId] < 0)
+			throw new Error("Invalid position update");
+		holdings.set(userId, current);
+		if (delta !== 0)
+			result.positionUpdates.push({
+				userId,
+				outcomeId,
+				quantityUnitsDelta: delta,
+			});
+	}
 
 	// Convert orders to mutable format
 	const ordersForMatching: OrderForMatching[] = orders.map((o) => ({
@@ -380,8 +451,14 @@ export function executeMatching(
 			balanceUnitsDelta: 0,
 			lockedUnitsDelta: 0,
 		};
-		existing.balanceUnitsDelta += balanceUnitsDelta;
-		existing.lockedUnitsDelta += lockedUnitsDelta;
+		existing.balanceUnitsDelta = addUnits(
+			existing.balanceUnitsDelta,
+			balanceUnitsDelta,
+		);
+		existing.lockedUnitsDelta = addUnits(
+			existing.lockedUnitsDelta,
+			lockedUnitsDelta,
+		);
 		userBalanceChanges.set(userId, existing);
 	}
 
@@ -398,13 +475,11 @@ export function executeMatching(
 			const { matchQuantityUnits, participants, participatingOutcomeIds } =
 				syntheticMatch;
 
-			// Calculate total contribution for pro-rata distribution of surplus contracts
-			let totalContribution = 0;
-			for (const [, matchedOrders] of participants) {
-				for (const order of matchedOrders) {
-					totalContribution += order.priceUnits;
-				}
-			}
+			const matched = [...participants.values()].flat();
+			const weights = matched.map((order) => order.priceUnits);
+			const contributions = syntheticMatch.contributions;
+			const surplusShares = allocateUnits(matchQuantityUnits, weights);
+			let participantIndex = 0;
 
 			const executionParticipants: Party[] = [];
 
@@ -417,11 +492,8 @@ export function executeMatching(
 			// Process each participant in the match
 			for (const [outcomeId, matchedOrders] of participants) {
 				for (const order of matchedOrders) {
-					// Each participant pays their bid price
-					const fillCostUnits = multiplySharesByPrice(
-						matchQuantityUnits,
-						order.priceUnits,
-					);
+					// Each participant funds their pro-rata share of the basket cost
+					const fillCostUnits = contributions[participantIndex];
 
 					// The escrowed amount was at original price
 					const escrowUsedUnits = consumeEscrow(order, matchQuantityUnits);
@@ -435,11 +507,7 @@ export function executeMatching(
 					order.remainingQuantityUnits -= matchQuantityUnits;
 
 					// Add position update for the outcome they bid on
-					result.positionUpdates.push({
-						userId: order.userId,
-						outcomeId,
-						quantityUnitsDelta: matchQuantityUnits,
-					});
+					updatePosition(order.userId, outcomeId, matchQuantityUnits);
 
 					// Calculate pro-rata share of surplus contracts for non-participating outcomes
 					// Their share is proportional to their contribution (price * quantity)
@@ -447,23 +515,24 @@ export function executeMatching(
 					// When we mint a basket, we get 1 contract for EACH outcome
 					// Participants only want their specific outcome, so the others are surplus
 					for (const surplusOutcomeId of nonParticipatingOutcomeIds) {
-						const surplusQuantityUnits = prorateShareUnits(
-							matchQuantityUnits,
-							order.priceUnits,
-							totalContribution,
-						);
+						const surplusQuantityUnits = surplusShares[participantIndex];
 						if (surplusQuantityUnits > 0) {
-							result.positionUpdates.push({
-								userId: order.userId,
-								outcomeId: surplusOutcomeId,
-								quantityUnitsDelta: surplusQuantityUnits,
-							});
+							updatePosition(
+								order.userId,
+								surplusOutcomeId,
+								surplusQuantityUnits,
+							);
 						}
 					}
 
 					// Calculate effective price (what they actually paid per contract of their outcome)
-					// They paid order.price but also received surplus contracts worth something
-					const effectivePriceUnits = order.priceUnits;
+					// Cash allocation is exact; displayed price is rounded to a price unit
+					const effectivePriceUnits = prorateShareUnits(
+						fillCostUnits,
+						PRICE_SCALE,
+						matchQuantityUnits,
+					);
+					participantIndex += 1;
 
 					// Add to execution participants
 					executionParticipants.push({
@@ -471,6 +540,7 @@ export function executeMatching(
 						outcomeId,
 						quantityUnits: matchQuantityUnits,
 						effectivePriceUnits,
+						balanceUnitsDelta: -fillCostUnits,
 					});
 				}
 			}
@@ -509,12 +579,16 @@ export function executeMatching(
 				const buyerCostUnits = multiplySharesByPrice(
 					matchQuantityUnits,
 					matchPriceUnits,
+					"floor",
 				);
 				// Buyer had escrowed at their bid price
 				const buyerEscrowUsedUnits = consumeEscrow(
 					buyOrder,
 					matchQuantityUnits,
 				);
+
+				if (buyerCostUnits > buyerEscrowUsedUnits)
+					throw new Error("Buyer escrow is insufficient for the fill");
 
 				// Update buyer balance:
 				// - Deduct the actual cost from balance
@@ -525,43 +599,43 @@ export function executeMatching(
 					-buyerEscrowUsedUnits,
 				);
 
-				// Seller receives matchPrice per contract
-				const sellerProceedsUnits = multiplySharesByPrice(
-					matchQuantityUnits,
-					matchPriceUnits,
+				const ownedUnits = Math.max(
+					0,
+					holdings.get(sellOrder.userId)?.[outcomeId] ?? 0,
 				);
-				// Seller had escrowed for short position (if any)
-				const sellerEscrowUsedUnits = consumeEscrow(
-					sellOrder,
-					matchQuantityUnits,
+				const ownedFillUnits = Math.min(ownedUnits, matchQuantityUnits);
+				const shortFillUnits = matchQuantityUnits - ownedFillUnits;
+				// The seller funds a complete basket for each short contract and
+				// transfers this outcome to the buyer, retaining all other outcomes.
+				// Buyer and seller together pay exactly one unit per minted share.
+				const sellerBalanceDelta = buyerCostUnits - shortFillUnits;
+				const sellerRemainingQuantity =
+					sellOrder.remainingQuantityUnits - matchQuantityUnits;
+				const sellerReserved = calculateEscrow(
+					"sell",
+					sellerRemainingQuantity,
+					sellOrder.priceUnits,
+					ownedUnits - ownedFillUnits,
 				);
-
-				// Update seller balance:
-				// - Add the proceeds to balance
-				// - Release their escrow
+				const sellerEscrowUsedUnits =
+					sellOrder.remainingEscrowUnits - sellerReserved;
+				if (sellerEscrowUsedUnits < Math.max(0, -sellerBalanceDelta))
+					throw new Error("Seller escrow is insufficient for the short fill");
+				sellOrder.remainingEscrowUnits = sellerReserved;
 				updateUserBalance(
 					sellOrder.userId,
-					sellerProceedsUnits,
+					sellerBalanceDelta,
 					-sellerEscrowUsedUnits,
 				);
 
-				// Decrement order quantities
 				buyOrder.remainingQuantityUnits -= matchQuantityUnits;
-				sellOrder.remainingQuantityUnits -= matchQuantityUnits;
-
-				// Position updates:
-				// Buyer gains contracts
-				result.positionUpdates.push({
-					userId: buyOrder.userId,
-					outcomeId,
-					quantityUnitsDelta: matchQuantityUnits,
-				});
-				// Seller loses contracts (or goes short)
-				result.positionUpdates.push({
-					userId: sellOrder.userId,
-					outcomeId,
-					quantityUnitsDelta: -matchQuantityUnits,
-				});
+				sellOrder.remainingQuantityUnits = sellerRemainingQuantity;
+				updatePosition(buyOrder.userId, outcomeId, matchQuantityUnits);
+				updatePosition(sellOrder.userId, outcomeId, -ownedFillUnits);
+				for (const otherOutcomeId of outcomeIds) {
+					if (otherOutcomeId !== outcomeId)
+						updatePosition(sellOrder.userId, otherOutcomeId, shortFillUnits);
+				}
 
 				// Create execution record
 				result.executions.push({
@@ -574,12 +648,14 @@ export function executeMatching(
 							outcomeId,
 							quantityUnits: matchQuantityUnits,
 							effectivePriceUnits: matchPriceUnits,
+							balanceUnitsDelta: -buyerCostUnits,
 						},
 						{
 							userId: sellOrder.userId,
 							outcomeId,
 							quantityUnits: -matchQuantityUnits,
 							effectivePriceUnits: matchPriceUnits,
+							balanceUnitsDelta: sellerBalanceDelta,
 						},
 					],
 				});
@@ -645,11 +721,15 @@ export function validateOrder(
 		return { valid: false, error: "Direction must be buy or sell" };
 	}
 
-	if (quantityUnits <= 0 || !Number.isInteger(quantityUnits)) {
+	if (quantityUnits <= 0 || !Number.isSafeInteger(quantityUnits)) {
 		return { valid: false, error: "Quantity must be a positive integer" };
 	}
 
-	if (priceUnits <= 0 || priceUnits >= PRICE_SCALE) {
+	if (
+		!Number.isSafeInteger(priceUnits) ||
+		priceUnits <= 0 ||
+		priceUnits >= PRICE_SCALE
+	) {
 		return { valid: false, error: "Price must be between 0 and 1 (exclusive)" };
 	}
 

@@ -6,24 +6,52 @@ export type PriceUnits = number;
 export type ShareUnits = number;
 
 function assertInteger(value: number, label: string): void {
-	if (!Number.isInteger(value)) {
-		throw new Error(`${label} must be an integer`);
+	if (!Number.isSafeInteger(value)) {
+		throw new Error(`${label} must be a safe integer`);
 	}
 }
 
+export function addUnits(left: number, right: number): number {
+	assertInteger(left, "left units");
+	assertInteger(right, "right units");
+	const result = Number(BigInt(left) + BigInt(right));
+	assertInteger(result, "sum");
+	return result;
+}
+
 function divideRounded(
-	numerator: number,
-	denominator: number,
+	numerator: bigint,
+	denominator: bigint,
 	rounding: "floor" | "ceil" | "nearest",
 ): number {
-	switch (rounding) {
-		case "floor":
-			return Math.floor(numerator / denominator);
-		case "ceil":
-			return Math.ceil(numerator / denominator);
-		case "nearest":
-			return Math.round(numerator / denominator);
+	if (denominator <= 0n) throw new Error("denominator must be positive");
+	let quotient = numerator / denominator;
+	const remainder = numerator % denominator;
+	if (rounding === "floor" && remainder < 0n) quotient -= 1n;
+	if (rounding === "ceil" && remainder > 0n) quotient += 1n;
+	// Ties round toward positive infinity, matching Math.round.
+	if (rounding === "nearest") {
+		if (remainder > 0n && remainder * 2n >= denominator) quotient += 1n;
+		if (remainder < 0n && -remainder * 2n > denominator) quotient -= 1n;
 	}
+	const result = Number(quotient);
+	assertInteger(result, "result");
+	return result;
+}
+
+export function parseHoldings(json: string): Record<string, ShareUnits> {
+	const holdings: unknown = JSON.parse(json);
+	if (
+		holdings === null ||
+		typeof holdings !== "object" ||
+		Array.isArray(holdings)
+	)
+		throw new Error("Holdings must be an object");
+	for (const value of Object.values(holdings)) {
+		if (!Number.isSafeInteger(value) || value < 0)
+			throw new Error("Legacy short or unsafe holdings require reconciliation");
+	}
+	return holdings as Record<string, ShareUnits>;
 }
 
 export function coinsToUnits(coins: number): UnitAmount {
@@ -31,7 +59,9 @@ export function coinsToUnits(coins: number): UnitAmount {
 		throw new Error("coin amount must be finite");
 	}
 
-	return Math.round(coins * UNIT_SCALE);
+	const result = Math.round(coins * UNIT_SCALE);
+	assertInteger(result, "coin units");
+	return result;
 }
 
 export function unitsToCoins(units: UnitAmount): number {
@@ -40,7 +70,9 @@ export function unitsToCoins(units: UnitAmount): number {
 
 export function contractsToShareUnits(contracts: number): ShareUnits {
 	assertInteger(contracts, "contract quantity");
-	return contracts * UNIT_SCALE;
+	const result = contracts * UNIT_SCALE;
+	assertInteger(result, "share units");
+	return result;
 }
 
 export function shareUnitsToContracts(shareUnits: ShareUnits): number {
@@ -69,32 +101,74 @@ export function multiplySharesByPrice(
 	priceUnits: PriceUnits,
 	rounding: "floor" | "ceil" | "nearest" = "nearest",
 ): UnitAmount {
-	return divideRounded(shareUnits * priceUnits, PRICE_SCALE, rounding);
+	assertInteger(shareUnits, "share units");
+	assertInteger(priceUnits, "price units");
+	return divideRounded(
+		BigInt(shareUnits) * BigInt(priceUnits),
+		BigInt(PRICE_SCALE),
+		rounding,
+	);
 }
 
 export function prorateShareUnits(
 	totalShareUnits: ShareUnits,
 	numerator: number,
 	denominator: number,
+	rounding: "floor" | "ceil" | "nearest" = "nearest",
 ): ShareUnits {
-	if (denominator <= 0) return 0;
-	return divideRounded(totalShareUnits * numerator, denominator, "nearest");
+	assertInteger(totalShareUnits, "share units");
+	assertInteger(numerator, "numerator");
+	assertInteger(denominator, "denominator");
+	return divideRounded(
+		BigInt(totalShareUnits) * BigInt(numerator),
+		BigInt(denominator),
+		rounding,
+	);
+}
+
+/** Allocate every unit exactly once; stable input order breaks remainder ties. */
+export function allocateUnits(total: number, weights: number[]): number[] {
+	assertInteger(total, "allocation total");
+	if (total < 0 || weights.length === 0) throw new Error("invalid allocation");
+	for (const weight of weights) {
+		assertInteger(weight, "weight");
+		if (weight < 0) throw new Error("weight must be nonnegative");
+	}
+	const denominator = weights.reduce((sum, weight) => sum + BigInt(weight), 0n);
+	if (denominator === 0n)
+		throw new Error("allocation weights must be positive");
+	const products = weights.map((weight) => BigInt(total) * BigInt(weight));
+	const amounts = products.map((product) => Number(product / denominator));
+	const remaining = total - amounts.reduce((sum, amount) => sum + amount, 0);
+	const ranked = products.map((product, index) => ({
+		index,
+		remainder: product % denominator,
+	}));
+	ranked.sort((a, b) =>
+		a.remainder === b.remainder
+			? a.index - b.index
+			: a.remainder > b.remainder
+				? -1
+				: 1,
+	);
+	for (let i = 0; i < remaining; i++) amounts[ranked[i].index] += 1;
+	return amounts;
 }
 
 export function formatUnits(units: UnitAmount): string {
-	const coins = unitsToCoins(units);
-	if (Number.isInteger(coins)) {
-		return coins.toFixed(0);
-	}
-	return coins.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+	assertInteger(units, "units");
+	const value = BigInt(units);
+	const magnitude = value < 0n ? -value : value;
+	const whole = magnitude / BigInt(UNIT_SCALE);
+	const fraction = (magnitude % BigInt(UNIT_SCALE))
+		.toString()
+		.padStart(4, "0")
+		.replace(/0+$/, "");
+	return `${value < 0n ? "-" : ""}${whole}${fraction ? `.${fraction}` : ""}`;
 }
 
 export function formatShareUnits(shareUnits: ShareUnits): string {
-	const contracts = shareUnitsToContracts(shareUnits);
-	if (Number.isInteger(contracts)) {
-		return contracts.toFixed(0);
-	}
-	return contracts.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+	return formatUnits(shareUnits);
 }
 
 export function formatPriceUnits(priceUnits: PriceUnits): string {
