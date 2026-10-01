@@ -282,3 +282,23 @@ values after new accounting writes; rollback needs the pre-migration backup and
 matching old application version. Application and schema changes require a
 coordinated rollout. PR validation uses fixtures only and does not authorize a
 real-data migration or deployment.
+
+
+### Production workflow authorization
+
+Merging to main runs verification CI only. Fly deployment and container image
+publishing accept only manual `workflow_dispatch` events on main, with the
+`rollout_approved` boolean explicitly enabled. Its default is false; a push,
+unapproved dispatch, or dispatch from another branch cannot run either job.
+
+Approval to merge this accounting change does not approve a real migration,
+image publication, or deployment. First authorize and rehearse the migration on
+a disposable restored backup; reconcile legacy accounting, stop bot writers,
+prepare a tested backup rollback, and coordinate the schema/application switch.
+Then obtain explicit authorization for each production action and approved main
+commit. An authorized operator can use the GitHub Actions Run workflow UI on
+main and enable `rollout_approved` for Release or Deploy to Fly.io as appropriate.
+Verify main still points to the approved commit before dispatch. Neither workflow
+performs a database migration, so it must be completed and verified separately
+before deploying the new application. Do not dispatch these workflows as part of
+PR verification or the merge itself.
