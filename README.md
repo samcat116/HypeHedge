@@ -56,7 +56,9 @@ All effects, escrow/conservation assertions and the operation receipt commit in
 that same batch. Stale revisions are retried. Reusing an operation ID with different
 arguments fails. Every writer must use this ledger; direct administrative writes
 would bypass its snapshot protocol. Markets are bounded to 80 participants and
-2–10 outcomes to keep matching and settlement batches finite. Short sells mint
+2–10 outcomes to keep matching and settlement batches finite. The participant cap
+rejects new participants; existing holders can still sell or reorder at the cap.
+Short sells mint
 funded complete baskets; collateral equals every outcome's share supply and is
 paid exactly once at resolution. Cancel/fill/settle release their associated escrow.
 
@@ -74,6 +76,10 @@ A Durable Object transaction does **not** cover D1 calls. Captured reactions ret
 order across retries. The queue has finite capacity; saturation disconnects without
 advancing the checkpoint so Discord resume can replay. Reconnect, session invalidation,
 missed heartbeat acknowledgments, REST retries and rate limits are handled explicitly.
+Recovery disconnects preserve Discord resume sessions, while terminal shutdown
+invalidates them. Gateway upgrade requests use HTTPS URLs, as required by workerd.
+Concurrent scheduling retains the earliest alarm deadline, so sustained intake
+cannot postpone a queued drain.
 Backfill uses persisted bounded cursors: at most 500 channels, 1,000 messages
 per channel, and 10,000 users per reaction. Reaching an oversized scan boundary
 records an observable partial-scan failure; no further page is processed.

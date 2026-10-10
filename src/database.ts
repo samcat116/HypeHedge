@@ -581,10 +581,10 @@ export class Database {
 						marketId,
 					)
 				).count;
-				if (participantCount >= MAX_MARKET_PARTICIPANTS)
+				const position = await this.getPosition(userId, marketId);
+				if (participantCount >= MAX_MARKET_PARTICIPANTS && !position)
 					return { success: false, error: "Market participant limit reached" };
-				const holdings =
-					(await this.getPosition(userId, marketId))?.holdings ?? {};
+				const holdings = position?.holdings ?? {};
 				const escrowUnits = calculateEscrow(
 					direction,
 					quantityUnits,

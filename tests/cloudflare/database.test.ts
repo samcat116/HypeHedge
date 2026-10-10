@@ -39,6 +39,37 @@ beforeEach(async () => {
 	await env.DB.prepare("UPDATE revision SET version=0").run();
 });
 describe("D1 atomic ledger in workerd", () => {
+	it("allows existing holders to sell and reorder at the participant cap but rejects a new participant", async () => {
+		const market = await fixture();
+		const yes = market.outcomes[0].id;
+		const no = market.outcomes[1].id;
+		await store.createOrder("buyer", market.id, yes, "buy", 1, 5000);
+		await store.createOrder("seller", market.id, no, "buy", 1, 5000);
+		await store.executeMarket(market.id);
+		expect(await store.getOrder("buyer", market.id)).toBeNull();
+		for (let n = 0; n < 78; n++) {
+			const user = `participant-${n}`;
+			await fund(user, 1);
+			expect(
+				(await store.createOrder(user, market.id, yes, "buy", 1, 100)).success,
+			).toBe(true);
+		}
+		expect(
+			(await store.createOrder("buyer", market.id, yes, "sell", 1, 9000))
+				.success,
+		).toBe(true);
+		expect((await store.cancelOrder("buyer", market.id)).success).toBe(true);
+		expect(
+			(await store.createOrder("buyer", market.id, no, "buy", 1, 100)).success,
+		).toBe(true);
+		await fund("new-participant", 1);
+		expect(
+			await store.createOrder("new-participant", market.id, yes, "buy", 1, 100),
+		).toEqual({ success: false, error: "Market participant limit reached" });
+		expect((await store.getBalance("new-participant")).lockedUnits).toBe(0);
+		await invariant();
+	});
+
 	it("funds complete synthetic baskets with exact integer remainder allocation", async () => {
 		await fund("buyer");
 		await fund("seller");

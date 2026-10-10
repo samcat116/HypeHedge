@@ -1,10 +1,16 @@
-import { env, runInDurableObject } from "cloudflare:test";
+import {
+	env,
+	runDurableObjectAlarm,
+	runInDurableObject,
+} from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { GatewayDO } from "../../src/cloudflare/gateway";
+import { gatewayUpgradeUrl } from "../../src/cloudflare/gateway";
 import { Database } from "../../src/database";
 
 // biome-ignore lint/suspicious/noExplicitAny: White-box failure injection intentionally inspects private runtime fields and persisted JSON.
 type TestValue = any;
+
+const runtimeFetch = globalThis.fetch.bind(globalThis);
 
 beforeEach(() => {
 	vi.stubGlobal(
@@ -31,6 +37,105 @@ async function inside(
 }
 
 describe("durable Gateway capture", () => {
+	it("preserves the earliest drain deadline during sustained irrelevant dispatches", async () => {
+		const stub = gateway();
+		const db = new Database(env.DB);
+		await db.addReaction(
+			"schedule-message",
+			"schedule-reactor",
+			"schedule-author",
+			"x",
+			"schedule-add",
+		);
+		const origin = Date.now();
+		let offset = 0;
+		const clock = vi
+			.spyOn(Date, "now")
+			.mockImplementation(() => origin + offset);
+		try {
+			await inside(stub, async (instance, state) => {
+				await instance.frame({
+					op: 0,
+					s: 1,
+					t: "READY",
+					d: {
+						session_id: "alarm-session",
+						resume_gateway_url: "wss://gateway.discord.gg",
+					},
+				});
+				const id = ((BigInt(origin - 1420070400000) << 22n) + 25n).toString();
+				const response = await instance.fetch(
+					new Request("https://gateway/commands", {
+						method: "POST",
+						body: JSON.stringify({
+							id,
+							application_id: env.CLIENT_ID,
+							token: "fake-alarm",
+							type: 2,
+							guild_id: "91",
+							member: { user: { id: "92" } },
+							data: { name: "balance" },
+						}),
+					}),
+				);
+				expect(response.ok).toBe(true);
+				await response.text();
+				await instance.frame({
+					op: 0,
+					s: 2,
+					t: "MESSAGE_REACTION_REMOVE",
+					d: {
+						guild_id: "91",
+						message_id: "schedule-message",
+						user_id: "schedule-reactor",
+						emoji: { name: "x" },
+					},
+				});
+				const due = await state.storage.getAlarm();
+				for (let sequence = 3; sequence < 23; sequence++) {
+					offset += 100;
+					await instance.frame({
+						op: 0,
+						s: sequence,
+						t: "MESSAGE_CREATE",
+						d: {},
+					});
+					expect(await state.storage.getAlarm()).toBe(due);
+				}
+			});
+			expect(await runDurableObjectAlarm(stub)).toBe(true);
+			expect((await db.getBalance("schedule-author")).balanceUnits).toBe(0);
+			let edits = 0;
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => {
+					edits++;
+					return new Response(null, { status: 204 });
+				}),
+			);
+			await inside(stub, async (instance, state) => {
+				const due = await state.storage.getAlarm();
+				for (let sequence = 23; sequence < 43; sequence++) {
+					offset += 100;
+					await instance.frame({
+						op: 0,
+						s: sequence,
+						t: "MESSAGE_CREATE",
+						d: {},
+					});
+					expect(await state.storage.getAlarm()).toBe(due);
+				}
+			});
+			expect(await runDurableObjectAlarm(stub)).toBe(true);
+			expect(edits).toBe(1);
+			await inside(stub, async (_, state) => {
+				expect((await state.storage.list({ prefix: "job:" })).size).toBe(0);
+			});
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	it("captures before checkpoint and deduplicates replayed sequence", async () => {
 		const stub = gateway();
 		await inside(stub, async (instance, state) => {
@@ -198,6 +303,125 @@ describe("durable Gateway capture", () => {
 			expect(jobs[1].attempts).toBe(0);
 		});
 	});
+	it("converts Gateway WSS URLs to HTTPS and rejects insecure production endpoints", async () => {
+		expect(gatewayUpgradeUrl("wss://gateway.discord.gg/?v=10").href).toBe(
+			"https://gateway.discord.gg/?v=10",
+		);
+		expect(() => gatewayUpgradeUrl("ws://gateway.discord.gg")).toThrow();
+		expect(() => gatewayUpgradeUrl("http://gateway.discord.gg")).toThrow();
+		expect(gatewayUpgradeUrl("ws://127.0.0.1:1234", true).protocol).toBe(
+			"http:",
+		);
+		await expect(
+			runtimeFetch("wss://unsupported.invalid", {
+				headers: { Upgrade: "websocket" },
+			}),
+		).rejects.toThrow();
+	});
+	it("replays an uncaptured reaction after capacity recovery without invalidating the Discord session", async () => {
+		const stub = gateway();
+		let server!: WebSocket;
+		let resumable = true;
+		const frame = {
+			op: 0,
+			s: 2,
+			t: "MESSAGE_REACTION_ADD",
+			d: {
+				guild_id: "777001",
+				channel_id: "777002",
+				message_id: "777003",
+				user_id: "777004",
+				member: { user: { id: "777004", bot: false } },
+				emoji: { name: "👍" },
+			},
+		};
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (url: string) => {
+				if (String(url).includes("/gateway/bot"))
+					return Response.json({ url: "wss://fake.discord.test" });
+				if (String(url).includes("/channels/777002/messages/777003"))
+					return Response.json({ author: { id: "777005", bot: false } });
+				expect(new URL(String(url)).protocol).toBe("https:");
+				const pair = new WebSocketPair();
+				server = pair[1];
+				server.accept();
+				server.addEventListener("close", (event) => {
+					if (event.code === 1000 || event.code === 1001) resumable = false;
+				});
+				return new Response(null, { status: 101, webSocket: pair[0] });
+			}),
+		);
+		await inside(stub, async (instance, state) => {
+			const receive = () =>
+				new Promise<TestValue>((resolve) =>
+					server.addEventListener(
+						"message",
+						(event) => resolve(JSON.parse(String(event.data))),
+						{ once: true },
+					),
+				);
+			const dispatch = async (payload: TestValue) => {
+				const received = new Promise<void>((resolve) =>
+					instance.socket.addEventListener("message", () => resolve(), {
+						once: true,
+					}),
+				);
+				server.send(JSON.stringify(payload));
+				await received;
+				await instance.capture(async () => {});
+			};
+			await instance.connect();
+			let response = receive();
+			server.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 45000 } }));
+			expect((await response).op).toBe(2);
+			await dispatch({
+				op: 0,
+				s: 1,
+				t: "READY",
+				d: {
+					session_id: "held-session",
+					resume_gateway_url: "wss://fake.discord.test",
+				},
+			});
+			const filler: Record<string, TestValue> = {};
+			for (let i = 0; i < 512; i++)
+				filler[`job:filler:${i}`] = { kind: "event" };
+			const entries = Object.entries(filler);
+			for (let i = 0; i < entries.length; i += 128)
+				await state.storage.put(Object.fromEntries(entries.slice(i, i + 128)));
+			const closed = new Promise<number>((resolve) =>
+				server.addEventListener("close", (event) => resolve(event.code), {
+					once: true,
+				}),
+			);
+			await dispatch(frame);
+			expect(await closed).toBe(4000);
+			expect(resumable).toBe(true);
+			expect((await state.storage.get<TestValue>("session")).seq).toBe(1);
+			const keys = Object.keys(filler);
+			for (let i = 0; i < keys.length; i += 128)
+				await state.storage.delete(keys.slice(i, i + 128));
+			await instance.connect();
+			response = receive();
+			server.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 45000 } }));
+			expect(await response).toMatchObject({
+				op: 6,
+				d: { session_id: "held-session", seq: 1 },
+			});
+			if (resumable) {
+				await dispatch(frame);
+				await dispatch(frame);
+			} else await dispatch({ op: 9, d: false });
+			await instance.alarm();
+			expect(
+				(await new Database(env.DB).getBalance("777005")).balanceUnits,
+			).toBe(10000);
+			expect((await state.storage.list({ prefix: "job:" })).size).toBe(0);
+			instance.disconnect(false);
+		});
+	});
+
 	it("opens actual outbound sockets and resumes after reconnect", async () => {
 		const stub = gateway();
 		let server!: WebSocket;
@@ -206,6 +430,7 @@ describe("durable Gateway capture", () => {
 			vi.fn(async (url: string) => {
 				if (String(url).includes("/gateway/bot"))
 					return Response.json({ url: "wss://fake.discord.test" });
+				expect(new URL(String(url)).protocol).toBe("https:");
 				const pair = new WebSocketPair();
 				server = pair[1];
 				server.accept();

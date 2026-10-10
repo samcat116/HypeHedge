@@ -47,6 +47,16 @@ interface Backfill {
 const MAX_QUEUE = 512;
 const INTENTS = 1 | 512 | 1024; // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS
 
+/** Workers fetch upgrades use HTTP(S), even when Discord returns a WSS URL. */
+export function gatewayUpgradeUrl(raw: string, allowInsecure = false): URL {
+	const url = new URL(raw);
+	if (url.protocol === "wss:") url.protocol = "https:";
+	else if (allowInsecure && url.protocol === "ws:") url.protocol = "http:";
+	if (url.protocol !== "https:" && !(allowInsecure && url.protocol === "http:"))
+		throw new Error("Gateway requires a secure WebSocket URL");
+	return url;
+}
+
 /** Only reachable through a binding: the Worker never forwards public paths here. */
 export class GatewayDO {
 	private socket?: WebSocket;
@@ -180,7 +190,13 @@ export class GatewayDO {
 		});
 	}
 	private async schedule(delay = 1000) {
-		await this.state.storage.setAlarm(Date.now() + delay);
+		const deadline = Date.now() + delay;
+		// Intake and the effect lane can schedule concurrently. A later dispatch
+		// must never postpone an already scheduled drain or reconnect.
+		await this.state.storage.transaction(async (tx) => {
+			const existing = await tx.getAlarm();
+			if (existing === null || deadline < existing) await tx.setAlarm(deadline);
+		});
 	}
 	async alarm(): Promise<void> {
 		await this.exclusive(async () => {
@@ -279,7 +295,7 @@ export class GatewayDO {
 				this.session.id && this.session.url
 					? this.session.url
 					: (this.env.GATEWAY_URL ?? (await this.api("/gateway/bot")).url);
-			const parsed = new URL(url);
+			const parsed = gatewayUpgradeUrl(url, Boolean(this.env.GATEWAY_URL));
 			parsed.searchParams.set("v", "10");
 			parsed.searchParams.set("encoding", "json");
 			const response = await fetch(parsed, {
@@ -304,10 +320,10 @@ export class GatewayDO {
 			});
 			const closed = (event: CloseEvent | Event) => {
 				if (this.socket === socket) {
-					this.disconnect();
+					const code = "code" in event ? event.code : 0;
+					this.disconnect(code !== 4004 && code !== 4014);
 					this.state.waitUntil(
 						this.capture(async () => {
-							const code = "code" in event ? event.code : 0;
 							if (code === 4004 || code === 4014) {
 								await this.state.storage.put("enabled", false);
 								await this.failure(`Fatal Gateway close ${code}`);
@@ -333,13 +349,17 @@ export class GatewayDO {
 	private send(frame: unknown) {
 		this.socket?.send(JSON.stringify(frame));
 	}
-	private disconnect() {
+	private disconnect(resumable = true) {
 		if (this.heartbeat) clearInterval(this.heartbeat);
 		this.heartbeat = undefined;
 		const socket = this.socket;
 		this.socket = undefined;
 		try {
-			socket?.close(1000, "Reconnect");
+			// Discord invalidates sessions closed with 1000/1001. Recovery must preserve replay.
+			socket?.close(
+				resumable ? 4000 : 1000,
+				resumable ? "Reconnect" : "Stopped",
+			);
 		} catch {}
 	}
 	private beat() {
@@ -409,11 +429,11 @@ export class GatewayDO {
 					: { ...this.session, seq: frame.s ?? 0 };
 			const captured = await this.state.storage.transaction(async (tx) => {
 				const pending = await tx.list({ prefix: "job:", limit: MAX_QUEUE });
-				if (pending.size >= MAX_QUEUE) return false;
 				if (
 					frame.t === "MESSAGE_REACTION_ADD" ||
 					frame.t === "MESSAGE_REACTION_REMOVE"
 				) {
+					if (pending.size >= MAX_QUEUE) return false;
 					const ordinal = ((await tx.get<number>("captureCounter")) ?? 0) + 1;
 					await tx.put("captureCounter", ordinal);
 					const id = `event:${String(ordinal).padStart(16, "0")}:${next.id}:${frame.s}`;
@@ -434,7 +454,11 @@ export class GatewayDO {
 				return;
 			}
 			this.session = next;
-			await this.schedule();
+			if (
+				frame.t === "MESSAGE_REACTION_ADD" ||
+				frame.t === "MESSAGE_REACTION_REMOVE"
+			)
+				await this.schedule();
 		}
 	}
 	private async failure(reason: string) {
