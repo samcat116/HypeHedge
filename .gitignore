@@ -1,7 +1,6 @@
 node_modules/
-dist/
 .env
-*.db
-*.sqlite
-/.claude
-/.entire
+.dev.vars*
+dist/
+.wrangler/
+coverage/

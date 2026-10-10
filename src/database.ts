@@ -1,6 +1,4 @@
-import { and, desc, eq, gt, inArray, lt, sql } from "drizzle-orm";
 import {
-	type PriceUnits,
 	type ShareUnits,
 	UNIT_SCALE,
 	addUnits,
@@ -8,418 +6,57 @@ import {
 	formatUnits,
 	parseHoldings,
 } from "./accounting.js";
-import { db } from "./db";
-import {
-	backfillProgress,
-	executions,
-	markets,
-	orders,
-	outcomes,
-	positions,
-	reactions,
-	users,
-} from "./db/schema";
 import {
 	type Direction,
 	type Execution,
-	type Order,
-	type Party,
 	type Position,
 	calculateEscrow,
-	calculatePayout,
 	executeMatching,
-	generateId,
 	validateOrder,
 } from "./exchange.js";
-import { withSpan } from "./telemetry/index.js";
-import { logger } from "./telemetry/logger.js";
-import {
-	dbErrorsCounter,
-	dbQueryCounter,
-	dbQueryDuration,
-} from "./telemetry/metrics.js";
 
-async function withDbSpan<T>(
-	operation: string,
-	table: string,
-	fn: () => Promise<T>,
-): Promise<T> {
-	const startTime = performance.now();
-	dbQueryCounter.add(1, { operation, table });
-
-	return withSpan(
-		`db.${operation}`,
-		{
-			"db.system": "postgresql",
-			"db.operation": operation,
-			"db.sql.table": table,
-		},
-		async () => {
-			try {
-				const result = await fn();
-				return result;
-			} catch (error) {
-				dbErrorsCounter.add(1, { operation, table });
-				logger.error(`Database error: ${operation}`, {
-					table,
-					error: error instanceof Error ? error.message : String(error),
-				});
-				throw error;
-			} finally {
-				const duration = performance.now() - startTime;
-				dbQueryDuration.record(duration, { operation, table });
-			}
-		},
-	);
+export interface MarketRecord {
+	id: string;
+	number: number;
+	guildId: string;
+	creatorId: string;
+	description: string;
+	oracleType: string;
+	oracleUserId: string;
+	status: "open" | "resolved";
+	winningOutcomeId: string | null;
+	collateralUnits: number;
+	createdAt: Date;
+	resolvedAt: Date | null;
 }
-
-export async function initDatabase(): Promise<void> {
-	// Schema managed by drizzle-kit, just verify connection
-	await withDbSpan("select", "users", async () => {
-		await db.select().from(users).limit(1);
-	});
-	logger.info("Connected to database");
+export interface OutcomeRecord {
+	id: string;
+	marketId: string;
+	number: number;
+	description: string;
 }
-
-// ============================================================================
-// Reaction-based currency functions (unchanged)
-// ============================================================================
-
-export async function addReaction(
-	messageId: string,
-	reactorId: string,
-	authorId: string,
-	emoji: string,
-): Promise<boolean> {
-	return withDbSpan("insert", "reactions", async () => {
-		// Insert reaction, ignore if duplicate
-		const result = await db
-			.insert(reactions)
-			.values({ messageId, reactorId, authorId, emoji })
-			.onConflictDoNothing()
-			.returning();
-
-		if (result.length > 0) {
-			// Upsert user balance
-			await withDbSpan("upsert", "users", async () => {
-				await db
-					.insert(users)
-					.values({
-						discordId: authorId,
-						balanceUnits: UNIT_SCALE,
-						lockedUnits: 0,
-					})
-					.onConflictDoUpdate({
-						target: users.discordId,
-						set: { balanceUnits: sql`${users.balanceUnits} + ${UNIT_SCALE}` },
-					});
-			});
-			return true;
-		}
-		return false;
-	});
+export interface OrderRecord {
+	id: string;
+	userId: string;
+	marketId: string;
+	outcomeId: string;
+	direction: Direction;
+	quantityUnits: number;
+	priceUnits: number;
+	escrowUnits: number;
+	createdAt: Date;
 }
-
-export async function removeReaction(
-	messageId: string,
-	reactorId: string,
-	emoji: string,
-): Promise<boolean> {
-	return withDbSpan("delete", "reactions", async () => {
-		return db.transaction(async (tx) => {
-			const [reaction] = await tx
-				.delete(reactions)
-				.where(
-					and(
-						eq(reactions.messageId, messageId),
-						eq(reactions.reactorId, reactorId),
-						eq(reactions.emoji, emoji),
-					),
-				)
-				.returning({ authorId: reactions.authorId });
-			if (!reaction) return false;
-			// Reclaim spendable funds without making balances negative or
-			// removing collateral that still backs resting orders.
-			await tx
-				.update(users)
-				.set({
-					balanceUnits: sql`GREATEST(${users.lockedUnits}, ${users.balanceUnits} - ${UNIT_SCALE})`,
-				})
-				.where(eq(users.discordId, reaction.authorId));
-			return true;
-		});
-	});
+export interface PositionRecord {
+	id: string;
+	userId: string;
+	marketId: string;
+	holdings: string;
+	createdAt: Date;
+	updatedAt: Date;
 }
-
-export async function getBalance(userId: string): Promise<{
-	balanceUnits: number;
-	lockedUnits: number;
-	availableUnits: number;
-}> {
-	return withDbSpan("select", "users", async () => {
-		const [user] = await db
-			.select({
-				balanceUnits: users.balanceUnits,
-				lockedUnits: users.lockedUnits,
-			})
-			.from(users)
-			.where(eq(users.discordId, userId));
-
-		const balanceUnits = user?.balanceUnits ?? 0;
-		const lockedUnits = user?.lockedUnits ?? 0;
-		return {
-			balanceUnits,
-			lockedUnits,
-			availableUnits: balanceUnits - lockedUnits,
-		};
-	});
-}
-
-export interface LeaderboardEntry {
-	discord_id: string;
-	balanceUnits: number;
-	rank: number;
-}
-
-export async function getLeaderboard(limit = 10): Promise<LeaderboardEntry[]> {
-	return withDbSpan("select", "users", async () => {
-		const results = await db
-			.select({
-				discord_id: users.discordId,
-				balanceUnits: users.balanceUnits,
-			})
-			.from(users)
-			.where(gt(users.balanceUnits, 0))
-			.orderBy(desc(users.balanceUnits))
-			.limit(limit);
-
-		return results.map((r, i) => ({ ...r, rank: i + 1 }));
-	});
-}
-
-export interface PaginatedLeaderboard {
-	entries: LeaderboardEntry[];
-	totalCount: number;
-	hasMore: boolean;
-}
-
-export async function getLeaderboardPaginated(
-	page: number,
-	pageSize = 10,
-): Promise<PaginatedLeaderboard> {
-	return withDbSpan("select", "users", async () => {
-		const offset = page * pageSize;
-
-		const [results, countResult] = await Promise.all([
-			db
-				.select({
-					discord_id: users.discordId,
-					balanceUnits: users.balanceUnits,
-				})
-				.from(users)
-				.where(gt(users.balanceUnits, 0))
-				.orderBy(desc(users.balanceUnits))
-				.limit(pageSize)
-				.offset(offset),
-			db
-				.select({ count: sql<number>`count(*)` })
-				.from(users)
-				.where(gt(users.balanceUnits, 0)),
-		]);
-
-		const totalCount = Number(countResult[0]?.count ?? 0);
-		const entries = results.map((r, i) => ({
-			...r,
-			rank: offset + i + 1,
-		}));
-
-		return {
-			entries,
-			totalCount,
-			hasMore: offset + entries.length < totalCount,
-		};
-	});
-}
-
-// ============================================================================
-// Backfill progress functions (unchanged)
-// ============================================================================
-
-export type BackfillProgressRecord = typeof backfillProgress.$inferSelect;
-
-export async function getOrCreateChannelProgress(
-	guildId: string,
-	channelId: string,
-): Promise<BackfillProgressRecord> {
-	return withDbSpan("upsert", "backfill_progress", async () => {
-		const [existing] = await db
-			.select()
-			.from(backfillProgress)
-			.where(
-				and(
-					eq(backfillProgress.guildId, guildId),
-					eq(backfillProgress.channelId, channelId),
-				),
-			);
-
-		if (existing) return existing;
-
-		const [created] = await db
-			.insert(backfillProgress)
-			.values({ guildId, channelId, status: "pending" })
-			.returning();
-
-		return created;
-	});
-}
-
-export async function updateChannelProgress(
-	guildId: string,
-	channelId: string,
-	lastMessageId: string,
-	messagesIncrement: number,
-	reactionsIncrement: number,
-): Promise<void> {
-	await withDbSpan("update", "backfill_progress", async () => {
-		await db
-			.update(backfillProgress)
-			.set({
-				lastMessageId,
-				messagesProcessed: sql`${backfillProgress.messagesProcessed} + ${messagesIncrement}`,
-				reactionsAdded: sql`${backfillProgress.reactionsAdded} + ${reactionsIncrement}`,
-				status: "in_progress",
-				updatedAt: sql`now()`,
-			})
-			.where(
-				and(
-					eq(backfillProgress.guildId, guildId),
-					eq(backfillProgress.channelId, channelId),
-				),
-			);
-	});
-}
-
-export async function markChannelCompleted(
-	guildId: string,
-	channelId: string,
-): Promise<void> {
-	await withDbSpan("update", "backfill_progress", async () => {
-		await db
-			.update(backfillProgress)
-			.set({
-				status: "completed",
-				updatedAt: sql`now()`,
-			})
-			.where(
-				and(
-					eq(backfillProgress.guildId, guildId),
-					eq(backfillProgress.channelId, channelId),
-				),
-			);
-	});
-}
-
-export async function getGuildBackfillProgress(
-	guildId: string,
-): Promise<BackfillProgressRecord[]> {
-	return withDbSpan("select", "backfill_progress", async () => {
-		return db
-			.select()
-			.from(backfillProgress)
-			.where(eq(backfillProgress.guildId, guildId));
-	});
-}
-
-export async function resetStaleProgress(guildId: string): Promise<void> {
-	await withDbSpan("update", "backfill_progress", async () => {
-		const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
-		await db
-			.update(backfillProgress)
-			.set({ status: "pending", updatedAt: sql`now()` })
-			.where(
-				and(
-					eq(backfillProgress.guildId, guildId),
-					eq(backfillProgress.status, "in_progress"),
-					lt(backfillProgress.updatedAt, oneHourAgo),
-				),
-			);
-	});
-}
-
-export async function resetGuildBackfillProgress(
-	guildId: string,
-): Promise<void> {
-	await withDbSpan("delete", "backfill_progress", async () => {
-		await db
-			.delete(backfillProgress)
-			.where(eq(backfillProgress.guildId, guildId));
-	});
-}
-
-export interface ReactionBatchItem {
-	messageId: string;
-	reactorId: string;
-	authorId: string;
-	emoji: string;
-}
-
-export async function addReactionsBatch(
-	reactionBatch: ReactionBatchItem[],
-): Promise<number> {
-	if (reactionBatch.length === 0) return 0;
-
-	return withDbSpan("batch_insert", "reactions", async () => {
-		// Insert all reactions, ignoring duplicates
-		const inserted = await db
-			.insert(reactions)
-			.values(reactionBatch)
-			.onConflictDoNothing()
-			.returning({ authorId: reactions.authorId });
-
-		if (inserted.length === 0) return 0;
-
-		// Count reactions per author for balance updates
-		const authorCounts = new Map<string, number>();
-		for (const { authorId } of inserted) {
-			authorCounts.set(authorId, (authorCounts.get(authorId) ?? 0) + 1);
-		}
-
-		// Batch update balances
-		await withDbSpan("batch_upsert", "users", async () => {
-			for (const [authorId, count] of authorCounts) {
-				await db
-					.insert(users)
-					.values({
-						discordId: authorId,
-						balanceUnits: count * UNIT_SCALE,
-						lockedUnits: 0,
-					})
-					.onConflictDoUpdate({
-						target: users.discordId,
-						set: {
-							balanceUnits: sql`${users.balanceUnits} + ${count * UNIT_SCALE}`,
-						},
-					});
-			}
-		});
-
-		return inserted.length;
-	});
-}
-
-// ============================================================================
-// Market functions (P2P Exchange)
-// ============================================================================
-
-export type MarketRecord = typeof markets.$inferSelect;
-export type OutcomeRecord = typeof outcomes.$inferSelect;
-export type OrderRecord = typeof orders.$inferSelect;
-export type PositionRecord = typeof positions.$inferSelect;
-
 export interface MarketWithOutcomes extends MarketRecord {
 	outcomes: OutcomeRecord[];
 }
-
 export interface CreateMarketParams {
 	guildId: string;
 	creatorId: string;
@@ -427,466 +64,38 @@ export interface CreateMarketParams {
 	description: string;
 	outcomeDescriptions: string[];
 }
-
-export async function createMarket(
-	params: CreateMarketParams,
-): Promise<MarketWithOutcomes> {
-	return withDbSpan("insert", "markets", async () => {
-		const marketId = generateId();
-
-		// Create market
-		const [market] = await db
-			.insert(markets)
-			.values({
-				id: marketId,
-				guildId: params.guildId,
-				creatorId: params.creatorId,
-				description: params.description,
-				oracleType: "manual",
-				oracleUserId: params.oracleUserId,
-			})
-			.returning();
-
-		// Create outcomes
-		const outcomeRecords: OutcomeRecord[] = [];
-		for (let i = 0; i < params.outcomeDescriptions.length; i++) {
-			const [outcome] = await db
-				.insert(outcomes)
-				.values({
-					id: generateId(),
-					marketId,
-					number: i + 1,
-					description: params.outcomeDescriptions[i],
-				})
-				.returning();
-			outcomeRecords.push(outcome);
-		}
-
-		return { ...market, outcomes: outcomeRecords };
-	});
-}
-
-export async function getMarket(
-	marketId: string,
-): Promise<MarketWithOutcomes | null> {
-	return withDbSpan("select", "markets", async () => {
-		const [market] = await db
-			.select()
-			.from(markets)
-			.where(eq(markets.id, marketId));
-
-		if (!market) return null;
-
-		const marketOutcomes = await db
-			.select()
-			.from(outcomes)
-			.where(eq(outcomes.marketId, marketId))
-			.orderBy(outcomes.number);
-
-		return { ...market, outcomes: marketOutcomes };
-	});
-}
-
-export async function getMarketByNumber(
-	guildId: string,
-	marketNumber: number,
-): Promise<MarketWithOutcomes | null> {
-	return withDbSpan("select", "markets", async () => {
-		const [market] = await db
-			.select()
-			.from(markets)
-			.where(
-				and(eq(markets.guildId, guildId), eq(markets.number, marketNumber)),
-			);
-
-		if (!market) return null;
-
-		const marketOutcomes = await db
-			.select()
-			.from(outcomes)
-			.where(eq(outcomes.marketId, market.id))
-			.orderBy(outcomes.number);
-
-		return { ...market, outcomes: marketOutcomes };
-	});
-}
-
-export async function getGuildOpenMarkets(
-	guildId: string,
-): Promise<MarketWithOutcomes[]> {
-	return withDbSpan("select", "markets", async () => {
-		const marketRecords = await db
-			.select()
-			.from(markets)
-			.where(and(eq(markets.guildId, guildId), eq(markets.status, "open")))
-			.orderBy(desc(markets.createdAt));
-
-		const result: MarketWithOutcomes[] = [];
-		for (const market of marketRecords) {
-			const marketOutcomes = await db
-				.select()
-				.from(outcomes)
-				.where(eq(outcomes.marketId, market.id))
-				.orderBy(outcomes.number);
-			result.push({ ...market, outcomes: marketOutcomes });
-		}
-
-		return result;
-	});
-}
-
-export async function getOracleOpenMarkets(
-	guildId: string,
-	oracleId: string,
-): Promise<MarketWithOutcomes[]> {
-	return withDbSpan("select", "markets", async () => {
-		const marketRecords = await db
-			.select()
-			.from(markets)
-			.where(
-				and(
-					eq(markets.guildId, guildId),
-					eq(markets.oracleUserId, oracleId),
-					eq(markets.status, "open"),
-				),
-			)
-			.orderBy(desc(markets.createdAt));
-
-		const result: MarketWithOutcomes[] = [];
-		for (const market of marketRecords) {
-			const marketOutcomes = await db
-				.select()
-				.from(outcomes)
-				.where(eq(outcomes.marketId, market.id))
-				.orderBy(outcomes.number);
-			result.push({ ...market, outcomes: marketOutcomes });
-		}
-
-		return result;
-	});
-}
-
-export interface PaginatedMarkets {
-	markets: MarketWithOutcomes[];
-	totalCount: number;
-	hasMore: boolean;
-}
-
-export async function getGuildMarketsPaginated(
-	guildId: string,
-	page: number,
-	pageSize = 5,
-	status?: "open" | "resolved",
-): Promise<PaginatedMarkets> {
-	return withDbSpan("select", "markets", async () => {
-		const offset = page * pageSize;
-		const conditions = [eq(markets.guildId, guildId)];
-		if (status) {
-			conditions.push(eq(markets.status, status));
-		}
-
-		const [marketRecords, countResult] = await Promise.all([
-			db
-				.select()
-				.from(markets)
-				.where(and(...conditions))
-				.orderBy(desc(markets.createdAt))
-				.limit(pageSize)
-				.offset(offset),
-			db
-				.select({ count: sql<number>`count(*)` })
-				.from(markets)
-				.where(and(...conditions)),
-		]);
-
-		const totalCount = Number(countResult[0]?.count ?? 0);
-
-		// Fetch outcomes for each market
-		const result: MarketWithOutcomes[] = [];
-		for (const market of marketRecords) {
-			const marketOutcomes = await db
-				.select()
-				.from(outcomes)
-				.where(eq(outcomes.marketId, market.id))
-				.orderBy(outcomes.number);
-			result.push({ ...market, outcomes: marketOutcomes });
-		}
-
-		return {
-			markets: result,
-			totalCount,
-			hasMore: offset + result.length < totalCount,
-		};
-	});
-}
-
-// ============================================================================
-// Order functions
-// ============================================================================
-
 export interface CreateOrderResult {
 	success: boolean;
 	order?: OrderRecord;
 	executions?: Execution[];
 	error?: string;
 }
-
-export async function createOrder(
-	userId: string,
-	marketId: string,
-	outcomeId: string,
-	direction: Direction,
-	quantity: number,
-	priceUnits: PriceUnits,
-): Promise<CreateOrderResult> {
-	if (
-		!Number.isSafeInteger(quantity) ||
-		quantity <= 0 ||
-		!Number.isSafeInteger(quantity * UNIT_SCALE)
-	) {
-		return {
-			success: false,
-			error: "Quantity must be a positive integer within the supported range",
-		};
-	}
-	return withDbSpan("transaction", "orders", async () => {
-		return db.transaction(async (tx) => {
-			// 1. Verify market is open
-			const [market] = await tx
-				.select()
-				.from(markets)
-				.where(eq(markets.id, marketId))
-				.for("update");
-
-			if (!market || market.status !== "open") {
-				return { success: false, error: "Market not open" };
-			}
-
-			// 2. Verify outcome exists
-			const [outcome] = await tx
-				.select()
-				.from(outcomes)
-				.where(
-					and(eq(outcomes.id, outcomeId), eq(outcomes.marketId, marketId)),
-				);
-
-			if (!outcome) {
-				return { success: false, error: "Invalid outcome" };
-			}
-
-			// 3. Check user doesn't already have an order in this market
-			const [existingOrder] = await tx
-				.select()
-				.from(orders)
-				.where(and(eq(orders.userId, userId), eq(orders.marketId, marketId)));
-
-			if (existingOrder) {
-				return {
-					success: false,
-					error: "You already have an order in this market. Cancel it first.",
-				};
-			}
-
-			// 4. Get user's current holdings in this outcome
-			const [position] = await tx
-				.select()
-				.from(positions)
-				.where(
-					and(eq(positions.userId, userId), eq(positions.marketId, marketId)),
-				);
-
-			const holdings: Record<string, number> = position
-				? parseHoldings(position.holdings)
-				: {};
-			const currentlyOwnedUnits = holdings[outcomeId] ?? 0;
-			const quantityUnits = contractsToShareUnits(quantity);
-			const validation = validateOrder(direction, quantityUnits, priceUnits);
-			if (!validation.valid) {
-				return {
-					success: false,
-					error: validation.error ?? "Invalid order",
-				};
-			}
-
-			// 5. Calculate escrow required
-			const escrowUnits = calculateEscrow(
-				direction,
-				quantityUnits,
-				priceUnits,
-				currentlyOwnedUnits,
-			);
-
-			// 6. Check user has sufficient available balance
-			const [user] = await tx
-				.select({
-					balanceUnits: users.balanceUnits,
-					lockedUnits: users.lockedUnits,
-				})
-				.from(users)
-				.where(eq(users.discordId, userId))
-				.for("update");
-
-			const balanceUnits = user?.balanceUnits ?? 0;
-			const lockedUnits = user?.lockedUnits ?? 0;
-			const availableUnits = balanceUnits - lockedUnits;
-
-			if (availableUnits < escrowUnits) {
-				return {
-					success: false,
-					error: `Insufficient balance. Need ${formatUnits(escrowUnits)}, have ${formatUnits(availableUnits)} available`,
-				};
-			}
-
-			// 7. Lock the escrow amount
-			await tx
-				.update(users)
-				.set({ lockedUnits: sql`${users.lockedUnits} + ${escrowUnits}` })
-				.where(eq(users.discordId, userId));
-
-			// 8. Create the order
-			const orderId = generateId();
-			const [order] = await tx
-				.insert(orders)
-				.values({
-					id: orderId,
-					userId,
-					marketId,
-					outcomeId,
-					direction,
-					quantityUnits,
-					priceUnits,
-					escrowUnits,
-				})
-				.returning();
-
-			return { success: true, order };
-		});
-	});
+export interface PayoutInfo {
+	userId: string;
+	shareUnits: number;
+	payoutUnits: number;
 }
-
-export async function cancelOrder(
-	userId: string,
-	marketId: string,
-): Promise<{ success: boolean; error?: string }> {
-	return withDbSpan("transaction", "orders", async () => {
-		return db.transaction(async (tx) => {
-			await tx
-				.select()
-				.from(markets)
-				.where(eq(markets.id, marketId))
-				.for("update");
-			// 1. Find the order
-			const [order] = await tx
-				.select()
-				.from(orders)
-				.where(and(eq(orders.userId, userId), eq(orders.marketId, marketId)));
-
-			if (!order) {
-				return { success: false, error: "No order found in this market" };
-			}
-
-			// 2. Unlock escrowed funds
-			await tx
-				.update(users)
-				.set({ lockedUnits: sql`${users.lockedUnits} - ${order.escrowUnits}` })
-				.where(eq(users.discordId, userId));
-
-			// 3. Delete the order
-			await tx.delete(orders).where(eq(orders.id, order.id));
-
-			return { success: true };
-		});
-	});
+export interface ResolveMarketResult {
+	market: MarketRecord;
+	payouts: PayoutInfo[];
+	totalPayoutUnits: number;
+	winnerCount: number;
 }
-
-export async function getOrder(
-	userId: string,
-	marketId: string,
-): Promise<OrderRecord | null> {
-	return withDbSpan("select", "orders", async () => {
-		const [order] = await db
-			.select()
-			.from(orders)
-			.where(and(eq(orders.userId, userId), eq(orders.marketId, marketId)));
-
-		return order ?? null;
-	});
+export interface LeaderboardEntry {
+	discord_id: string;
+	balanceUnits: number;
+	rank: number;
 }
-
-export async function getUserOrders(userId: string): Promise<OrderRecord[]> {
-	return withDbSpan("select", "orders", async () => {
-		return db.select().from(orders).where(eq(orders.userId, userId));
-	});
+export interface PaginatedLeaderboard {
+	entries: LeaderboardEntry[];
+	totalCount: number;
+	hasMore: boolean;
 }
-
-export async function getMarketOrders(
-	marketId: string,
-): Promise<OrderRecord[]> {
-	return withDbSpan("select", "orders", async () => {
-		return db.select().from(orders).where(eq(orders.marketId, marketId));
-	});
+export interface PaginatedMarkets {
+	markets: MarketWithOutcomes[];
+	totalCount: number;
+	hasMore: boolean;
 }
-
-export async function getUserMarketsWithOrders(
-	userId: string,
-	guildId: string,
-): Promise<MarketWithOutcomes[]> {
-	return withDbSpan("select", "orders", async () => {
-		const userOrders = await db
-			.select({ marketId: orders.marketId })
-			.from(orders)
-			.where(eq(orders.userId, userId));
-
-		const marketIds = userOrders.map((o) => o.marketId);
-		if (marketIds.length === 0) return [];
-
-		const result: MarketWithOutcomes[] = [];
-		for (const marketId of marketIds) {
-			const [market] = await db
-				.select()
-				.from(markets)
-				.where(and(eq(markets.id, marketId), eq(markets.guildId, guildId)));
-
-			if (market) {
-				const marketOutcomes = await db
-					.select()
-					.from(outcomes)
-					.where(eq(outcomes.marketId, marketId))
-					.orderBy(outcomes.number);
-				result.push({ ...market, outcomes: marketOutcomes });
-			}
-		}
-
-		return result;
-	});
-}
-
-// ============================================================================
-// Position functions
-// ============================================================================
-
-export async function getPosition(
-	userId: string,
-	marketId: string,
-): Promise<Position | null> {
-	return withDbSpan("select", "positions", async () => {
-		const [position] = await db
-			.select()
-			.from(positions)
-			.where(
-				and(eq(positions.userId, userId), eq(positions.marketId, marketId)),
-			);
-
-		if (!position) return null;
-
-		return {
-			userId: position.userId,
-			marketId: position.marketId,
-			holdings: parseHoldings(position.holdings),
-		};
-	});
-}
-
 export interface UserPositionView {
 	marketId: string;
 	marketNumber: number;
@@ -895,380 +104,864 @@ export interface UserPositionView {
 	holdings: Record<string, ShareUnits>;
 	order: OrderRecord | null;
 }
-
-export async function getUserPositions(
-	userId: string,
-	guildId?: string,
-): Promise<UserPositionView[]> {
-	return withDbSpan("select", "positions", async () => {
-		const conditions = [eq(positions.userId, userId)];
-		if (guildId) {
-			conditions.push(eq(markets.guildId, guildId));
-		}
-
-		const userPositions = await db
-			.select({
-				positionId: positions.id,
-				marketId: positions.marketId,
-				holdings: positions.holdings,
-				marketNumber: markets.number,
-				marketDescription: markets.description,
-				marketStatus: markets.status,
-			})
-			.from(positions)
-			.innerJoin(markets, eq(positions.marketId, markets.id))
-			.where(and(...conditions));
-
-		const result: UserPositionView[] = [];
-		for (const pos of userPositions) {
-			// Get user's order in this market if any
-			const [order] = await db
-				.select()
-				.from(orders)
-				.where(
-					and(eq(orders.userId, userId), eq(orders.marketId, pos.marketId)),
+export interface ReactionBatchItem {
+	messageId: string;
+	reactorId: string;
+	authorId: string;
+	emoji: string;
+}
+export interface BackfillProgressRecord {
+	guildId: string;
+	channelId: string;
+	lastMessageId: string | null;
+	messagesProcessed: number;
+	reactionsAdded: number;
+	status: string;
+	updatedAt: Date;
+}
+// biome-ignore lint/suspicious/noExplicitAny: This private SQL projection adapter maps heterogeneous rows; public APIs expose explicit records.
+type Row = Record<string, any>;
+// biome-ignore lint/suspicious/noExplicitAny: SQL aliases are narrowed at each public query API.
+const aliases = (r: Row): any =>
+	Object.fromEntries(
+		Object.entries(r).map(([k, v]) => [
+			k.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()),
+			["created_at", "updated_at", "resolved_at"].includes(k) && v !== null
+				? new Date(v as number)
+				: v,
+		]),
+	);
+const MAX_MARKET_PARTICIPANTS = 80;
+/** Fresh D1 ledger. A global revision makes all reads in a mutation an optimistic
+ * snapshot. Every writer MUST go through mutate; reads are never a transaction.
+ * CAS, effects, invariant assertions and receipt execute in one atomic D1 batch. */
+export class Database {
+	constructor(readonly db: D1Database) {}
+	private sql(q: string, ...values: unknown[]) {
+		return this.db.prepare(q).bind(...values);
+	}
+	// biome-ignore lint/suspicious/noExplicitAny: Private SQL projection boundary.
+	private async rows(q: string, ...v: unknown[]): Promise<any[]> {
+		return (await this.sql(q, ...v).all<Row>()).results.map(aliases);
+	}
+	// biome-ignore lint/suspicious/noExplicitAny: Private SQL projection boundary.
+	private async one(q: string, ...v: unknown[]): Promise<any | null> {
+		return (await this.rows(q, ...v))[0] ?? null;
+	}
+	private assertion(q: string, ...v: unknown[]) {
+		return this.sql(
+			`INSERT INTO operation_assertions(ok) SELECT CASE WHEN (${q}) THEN 1 ELSE 0 END`,
+			...v,
+		);
+	}
+	private async mutate<T>(
+		kind: string,
+		request: unknown,
+		operationId: string | undefined,
+		build: (statements: D1PreparedStatement[]) => Promise<T>,
+	): Promise<T> {
+		const id = operationId ?? crypto.randomUUID();
+		const encoded = JSON.stringify(request);
+		for (let attempt = 0; attempt < 12; attempt++) {
+			const receipt = await this.one(
+				"SELECT * FROM operation_receipts WHERE id=?",
+				id,
+			);
+			if (receipt) {
+				if (receipt.kind !== kind || receipt.request !== encoded)
+					throw new Error("Operation ID reused with different request");
+				return JSON.parse(receipt.result, (key, value) =>
+					["createdAt", "resolvedAt", "updatedAt"].includes(key) &&
+					typeof value === "string"
+						? new Date(value)
+						: value,
+				) as T;
+			}
+			const revision = await this.one(
+				"SELECT version FROM revision WHERE id=1",
+			);
+			const statements: D1PreparedStatement[] = [];
+			let result: T;
+			try {
+				result = await build(statements);
+			} catch (error) {
+				if (
+					(await this.one("SELECT version FROM revision WHERE id=1"))
+						.version !== revision.version
+				)
+					continue;
+				throw error;
+			}
+			const batch = [
+				this.sql(
+					"UPDATE revision SET version=version+1 WHERE id=1 AND version=?",
+					revision.version,
+				),
+				this.assertion("changes()=1"),
+				...statements,
+				this.assertion(
+					"NOT EXISTS(SELECT 1 FROM users u WHERE u.locked_units != COALESCE((SELECT sum(o.escrow_units) FROM orders o WHERE o.user_id=u.discord_id),0))",
+				),
+				this.sql(
+					"INSERT INTO operation_receipts(id,kind,request,result,created_at) VALUES(?,?,?,?,?)",
+					id,
+					kind,
+					encoded,
+					JSON.stringify(result),
+					Date.now(),
+				),
+				this.sql("DELETE FROM operation_assertions"),
+			];
+			try {
+				await this.db.batch(batch);
+				return result;
+			} catch (error) {
+				// Only stale snapshot/competing identical operation is retried. Real SQL or
+				// invariant failures are visible rather than hidden behind generic retries.
+				const latest = await this.one(
+					"SELECT version FROM revision WHERE id=1",
 				);
-
-			result.push({
-				marketId: pos.marketId,
-				marketNumber: pos.marketNumber,
-				marketDescription: pos.marketDescription,
-				marketStatus: pos.marketStatus,
-				holdings: parseHoldings(pos.holdings),
-				order: order ?? null,
-			});
+				if (latest.version === revision.version) throw error;
+			}
 		}
-
-		return result;
-	});
-}
-
-// ============================================================================
-// Execution functions
-// ============================================================================
-
-export async function executeMarket(
-	marketId: string,
-): Promise<{ executions: Execution[]; error?: string }> {
-	return withDbSpan("transaction", "executions", async () => {
-		return db.transaction(async (tx) => {
-			// 1. Get market and verify it's open
-			const [market] = await tx
-				.select()
-				.from(markets)
-				.where(eq(markets.id, marketId))
-				.for("update");
-
-			if (!market || market.status !== "open") {
-				return { executions: [], error: "Market not open" };
-			}
-
-			// 2. Get all outcomes for this market
-			const marketOutcomes = await tx
-				.select()
-				.from(outcomes)
-				.where(eq(outcomes.marketId, marketId));
-
-			const outcomeIds = marketOutcomes.map((o) => o.id);
-
-			// 3. Get all orders for this market
-			const marketOrders = await tx
-				.select()
-				.from(orders)
-				.where(eq(orders.marketId, marketId));
-
-			if (marketOrders.length === 0) {
-				return { executions: [] };
-			}
-
-			// 4. Get all positions for this market
-			const marketPositions = await tx
-				.select()
-				.from(positions)
-				.where(eq(positions.marketId, marketId));
-
-			// Convert to exchange types
-			const orderData: Order[] = marketOrders.map((o) => ({
-				id: o.id,
-				userId: o.userId,
-				marketId: o.marketId,
-				outcomeId: o.outcomeId,
-				direction: o.direction as Direction,
-				quantityUnits: o.quantityUnits,
-				priceUnits: o.priceUnits,
-				escrowUnits: o.escrowUnits,
-			}));
-
-			const positionData: Position[] = marketPositions.map((p) => ({
-				userId: p.userId,
-				marketId: p.marketId,
-				holdings: parseHoldings(p.holdings),
-			}));
-
-			// 5. Run matching algorithm
-			const matchResult = executeMatching(
-				orderData,
-				positionData,
-				outcomeIds,
-				marketId,
-			);
-
-			const affectedUsers = matchResult.balanceUpdates.map(
-				(update) => update.userId,
-			);
-			if (affectedUsers.length > 0)
-				await tx
-					.select()
-					.from(users)
-					.where(inArray(users.discordId, affectedUsers))
-					.orderBy(users.discordId)
-					.for("update");
-
-			// 6. Apply balance updates
-			for (const update of matchResult.balanceUpdates.sort((a, b) =>
-				a.userId.localeCompare(b.userId),
-			)) {
-				await tx
-					.update(users)
-					.set({
-						balanceUnits: sql`${users.balanceUnits} + ${update.balanceUnitsDelta}`,
-						lockedUnits: sql`${users.lockedUnits} + ${update.lockedUnitsDelta}`,
-					})
-					.where(eq(users.discordId, update.userId));
-			}
-
-			// 7. Apply position updates
-			const positionUpdatesMap = new Map<string, Map<string, number>>();
-			for (const update of matchResult.positionUpdates) {
-				const key = `${update.userId}:${marketId}`;
-				if (!positionUpdatesMap.has(key)) {
-					positionUpdatesMap.set(key, new Map());
-				}
-				const outcomeMap = positionUpdatesMap.get(key);
-				if (outcomeMap) {
-					const current = outcomeMap.get(update.outcomeId) ?? 0;
-					outcomeMap.set(
-						update.outcomeId,
-						addUnits(current, update.quantityUnitsDelta),
-					);
-				}
-			}
-
-			for (const [key, outcomeMap] of positionUpdatesMap) {
-				const [posUserId] = key.split(":");
-
-				// Get existing position or create new one
-				const [existingPos] = await tx
-					.select()
-					.from(positions)
-					.where(
-						and(
-							eq(positions.userId, posUserId),
-							eq(positions.marketId, marketId),
-						),
-					);
-
-				const holdings: Record<string, ShareUnits> = existingPos
-					? parseHoldings(existingPos.holdings)
-					: {};
-
-				// Apply updates
-				for (const [outcomeId, delta] of outcomeMap) {
-					holdings[outcomeId] = addUnits(holdings[outcomeId] ?? 0, delta);
-					if (holdings[outcomeId] === 0) {
-						delete holdings[outcomeId];
-					}
-				}
-
-				if (existingPos) {
-					await tx
-						.update(positions)
-						.set({
-							holdings: JSON.stringify(holdings),
-							updatedAt: sql`now()`,
-						})
-						.where(eq(positions.id, existingPos.id));
-				} else {
-					await tx.insert(positions).values({
-						id: generateId(),
-						userId: posUserId,
-						marketId,
-						holdings: JSON.stringify(holdings),
-					});
-				}
-			}
-
-			// 8. Apply order updates
-			for (const update of matchResult.orderUpdates) {
-				if (update.newQuantityUnits === 0) {
-					// Delete fully filled order.
-					const [order] = await tx
-						.select()
-						.from(orders)
-						.where(eq(orders.id, update.orderId));
-
-					if (order) {
-						await tx.delete(orders).where(eq(orders.id, update.orderId));
-					}
-				} else {
-					// Update remaining quantity and remaining escrow after a partial fill.
-					await tx
-						.update(orders)
-						.set({
-							quantityUnits: update.newQuantityUnits,
-							escrowUnits: update.newEscrowUnits,
-						})
-						.where(eq(orders.id, update.orderId));
-				}
-			}
-
-			// 9. Record executions
-			for (const execution of matchResult.executions) {
-				await tx.insert(executions).values({
-					id: execution.id,
-					marketId: execution.marketId,
-					participants: JSON.stringify(execution.participants),
-				});
-			}
-
-			return { executions: matchResult.executions };
-		});
-	});
-}
-
-// ============================================================================
-// Resolution functions
-// ============================================================================
-
-export interface PayoutInfo {
-	userId: string;
-	shareUnits: ShareUnits;
-	payoutUnits: number;
-}
-
-export interface ResolveMarketResult {
-	market: MarketRecord;
-	payouts: PayoutInfo[];
-	totalPayoutUnits: number;
-	winnerCount: number;
-}
-
-export async function resolveMarket(
-	marketId: string,
-	winningOutcomeId: string,
-): Promise<ResolveMarketResult | null> {
-	return withDbSpan("transaction", "markets", async () => {
-		return db.transaction(async (tx) => {
-			// 1. Verify outcome exists and belongs to market
-			const [outcome] = await tx
-				.select()
-				.from(outcomes)
-				.where(
-					and(
-						eq(outcomes.id, winningOutcomeId),
-						eq(outcomes.marketId, marketId),
+		throw new Error("Ledger busy; retry the same operation ID");
+	}
+	async initDatabase() {
+		await this.one("SELECT version FROM revision WHERE id=1");
+	}
+	async getBalance(id: string) {
+		const u = await this.one("SELECT * FROM users WHERE discord_id=?", id);
+		const balanceUnits = u?.balanceUnits ?? 0;
+		const lockedUnits = u?.lockedUnits ?? 0;
+		return {
+			balanceUnits,
+			lockedUnits,
+			availableUnits: balanceUnits - lockedUnits,
+		};
+	}
+	async addReaction(
+		messageId: string,
+		reactorId: string,
+		authorId: string,
+		emoji: string,
+		operationId?: string,
+	): Promise<boolean> {
+		return this.mutate(
+			"reaction-add",
+			{ messageId, reactorId, authorId, emoji },
+			operationId,
+			async (s) => {
+				const r = await this.one(
+					"SELECT * FROM reactions WHERE message_id=? AND reactor_id=? AND emoji=?",
+					messageId,
+					reactorId,
+					emoji,
+				);
+				if (r?.active) return false;
+				if (r && r.authorId !== authorId)
+					throw new Error("Reaction author mismatch");
+				const credit = UNIT_SCALE - (r?.creditedUnits ?? 0);
+				s.push(
+					this.sql(
+						"INSERT INTO users(discord_id,balance_units) VALUES(?,?) ON CONFLICT(discord_id) DO UPDATE SET balance_units=balance_units+excluded.balance_units",
+						authorId,
+						credit,
 					),
 				);
-
-			if (!outcome) {
-				return null;
-			}
-
-			// 2. Update market status (only if still open)
-			const [updatedMarket] = await tx
-				.update(markets)
-				.set({
-					status: "resolved",
-					winningOutcomeId,
-					resolvedAt: sql`now()`,
-				})
-				.where(and(eq(markets.id, marketId), eq(markets.status, "open")))
-				.returning();
-
-			if (!updatedMarket) {
-				return null;
-			}
-
-			// 3. Cancel all outstanding orders and refund escrow
-			const marketOrders = await tx
-				.select()
-				.from(orders)
-				.where(eq(orders.marketId, marketId));
-
-			const marketPositions = await tx
-				.select()
-				.from(positions)
-				.where(eq(positions.marketId, marketId));
-			const affectedUsers = [
-				...new Set([
-					...marketOrders.map((order) => order.userId),
-					...marketPositions.map((position) => position.userId),
-				]),
-			];
-			if (affectedUsers.length > 0)
-				await tx
-					.select()
-					.from(users)
-					.where(inArray(users.discordId, affectedUsers))
-					.orderBy(users.discordId)
-					.for("update");
-
-			for (const order of marketOrders) {
-				await tx
-					.update(users)
-					.set({
-						lockedUnits: sql`${users.lockedUnits} - ${order.escrowUnits}`,
-					})
-					.where(eq(users.discordId, order.userId));
-			}
-
-			await tx.delete(orders).where(eq(orders.marketId, marketId));
-
-			// 4. Get all positions and calculate payouts
-
-			const payouts: PayoutInfo[] = [];
-			let totalPayoutUnits = 0;
-
-			for (const position of marketPositions) {
-				const holdings: Record<string, ShareUnits> = parseHoldings(
-					position.holdings,
+				s.push(
+					this.sql(
+						"INSERT INTO reactions VALUES(?,?,?,?,1,10000) ON CONFLICT(message_id,reactor_id,emoji) DO UPDATE SET active=1,credited_units=10000",
+						messageId,
+						reactorId,
+						emoji,
+						authorId,
+					),
 				);
-				const payoutUnits = calculatePayout(holdings, winningOutcomeId);
-
-				if (payoutUnits > 0) {
-					payouts.push({
-						userId: position.userId,
-						shareUnits: payoutUnits,
-						payoutUnits,
-					});
-					totalPayoutUnits = addUnits(totalPayoutUnits, payoutUnits);
-
-					// Credit user balance
-					await tx
-						.insert(users)
-						.values({
-							discordId: position.userId,
-							balanceUnits: payoutUnits,
-							lockedUnits: 0,
-						})
-						.onConflictDoUpdate({
-							target: users.discordId,
-							set: {
-								balanceUnits: sql`${users.balanceUnits} + ${payoutUnits}`,
-							},
-						});
-				}
-			}
-
-			// 5. Delete all positions for this market
-			await tx.delete(positions).where(eq(positions.marketId, marketId));
-
+				return true;
+			},
+		);
+	}
+	async removeReaction(
+		messageId: string,
+		reactorId: string,
+		emoji: string,
+		operationId?: string,
+	): Promise<boolean> {
+		return this.mutate(
+			"reaction-remove",
+			{ messageId, reactorId, emoji },
+			operationId,
+			async (s) => {
+				const r = await this.one(
+					"SELECT * FROM reactions WHERE message_id=? AND reactor_id=? AND emoji=?",
+					messageId,
+					reactorId,
+					emoji,
+				);
+				if (!r?.active) return false;
+				const b = await this.getBalance(r.authorId);
+				const debit = Math.min(b.availableUnits, r.creditedUnits);
+				s.push(
+					this.sql(
+						"UPDATE users SET balance_units=balance_units-? WHERE discord_id=?",
+						debit,
+						r.authorId,
+					),
+				);
+				s.push(
+					this.sql(
+						"UPDATE reactions SET active=0,credited_units=credited_units-? WHERE message_id=? AND reactor_id=? AND emoji=?",
+						debit,
+						messageId,
+						reactorId,
+						emoji,
+					),
+				);
+				return true;
+			},
+		);
+	}
+	async addReactionsBatch(items: ReactionBatchItem[], operationId?: string) {
+		let n = 0;
+		for (let i = 0; i < items.length; i++) {
+			const r = items[i];
+			if (
+				await this.addReaction(
+					r.messageId,
+					r.reactorId,
+					r.authorId,
+					r.emoji,
+					operationId ? `${operationId}:${i}` : undefined,
+				)
+			)
+				n++;
+		}
+		return n;
+	}
+	async getLeaderboard(limit = 10) {
+		return (await this.getLeaderboardPaginated(0, limit)).entries;
+	}
+	async getLeaderboardPaginated(
+		page: number,
+		pageSize = 10,
+	): Promise<PaginatedLeaderboard> {
+		const rows = await this.rows(
+			"SELECT discord_id,balance_units FROM users WHERE balance_units>0 ORDER BY balance_units DESC,discord_id LIMIT ? OFFSET ?",
+			pageSize,
+			page * pageSize,
+		);
+		const totalCount = (
+			await this.one(
+				"SELECT count(*) AS count FROM users WHERE balance_units>0",
+			)
+		).count;
+		return {
+			entries: rows.map((r, i) => ({
+				discord_id: r.discordId,
+				balanceUnits: r.balanceUnits,
+				rank: page * pageSize + i + 1,
+			})),
+			totalCount,
+			hasMore: (page + 1) * pageSize < totalCount,
+		};
+	}
+	async createMarket(
+		p: CreateMarketParams,
+		operationId?: string,
+	): Promise<MarketWithOutcomes> {
+		if (
+			p.outcomeDescriptions.length < 2 ||
+			p.outcomeDescriptions.length > 10 ||
+			!p.description.trim() ||
+			p.description.length > 1000 ||
+			p.outcomeDescriptions.some((o) => !o.trim() || o.length > 100)
+		)
+			throw new Error("Market needs 2–10 outcomes and bounded descriptions");
+		return this.mutate("market-create", p, operationId, async (s) => {
+			const id = crypto.randomUUID();
+			const now = Date.now();
+			const number = (
+				await this.one(
+					"SELECT COALESCE(max(number),0)+1 AS number FROM markets",
+				)
+			).number;
+			const outcomes = p.outcomeDescriptions.map((description, i) => ({
+				id: crypto.randomUUID(),
+				marketId: id,
+				number: i + 1,
+				description,
+			}));
+			s.push(
+				this.sql(
+					"INSERT INTO markets(id,number,guild_id,creator_id,description,oracle_user_id,created_at) VALUES(?,?,?,?,?,?,?)",
+					id,
+					number,
+					p.guildId,
+					p.creatorId,
+					p.description,
+					p.oracleUserId,
+					now,
+				),
+			);
+			for (const o of outcomes)
+				s.push(
+					this.sql(
+						"INSERT INTO outcomes(id,market_id,number,description) VALUES(?,?,?,?)",
+						o.id,
+						id,
+						o.number,
+						o.description,
+					),
+				);
 			return {
-				market: updatedMarket,
-				payouts,
-				totalPayoutUnits,
-				winnerCount: payouts.length,
+				id,
+				number,
+				guildId: p.guildId,
+				creatorId: p.creatorId,
+				description: p.description,
+				oracleUserId: p.oracleUserId,
+				oracleType: "manual",
+				status: "open",
+				winningOutcomeId: null,
+				collateralUnits: 0,
+				createdAt: new Date(now),
+				resolvedAt: null,
+				outcomes,
 			};
 		});
-	});
+	}
+	async getMarket(id: string): Promise<MarketWithOutcomes | null> {
+		const m = await this.one("SELECT * FROM markets WHERE id=?", id);
+		if (!m) return null;
+		return {
+			...m,
+			outcomes: await this.rows(
+				"SELECT * FROM outcomes WHERE market_id=? ORDER BY number",
+				id,
+			),
+		};
+	}
+	async getMarketByNumber(guild: string, n: number) {
+		const m = await this.one(
+			"SELECT id FROM markets WHERE guild_id=? AND number=?",
+			guild,
+			n,
+		);
+		return m ? this.getMarket(m.id) : null;
+	}
+	async getGuildMarketsPaginated(
+		guild: string,
+		page: number,
+		pageSize = 5,
+		status?: "open" | "resolved",
+	): Promise<PaginatedMarkets> {
+		const where = status ? "guild_id=? AND status=?" : "guild_id=?";
+		const args = status ? [guild, status] : [guild];
+		const rows = await this.rows(
+			`SELECT id FROM markets WHERE ${where} ORDER BY number DESC LIMIT ? OFFSET ?`,
+			...args,
+			pageSize,
+			page * pageSize,
+		);
+		const totalCount = (
+			await this.one(
+				`SELECT count(*) AS count FROM markets WHERE ${where}`,
+				...args,
+			)
+		).count;
+		return {
+			markets: (await Promise.all(
+				rows.map((m) => this.getMarket(m.id)),
+			)) as MarketWithOutcomes[],
+			totalCount,
+			hasMore: (page + 1) * pageSize < totalCount,
+		};
+	}
+	async getGuildOpenMarkets(guild: string) {
+		return (await this.getGuildMarketsPaginated(guild, 0, 100, "open")).markets;
+	}
+	async getOracleOpenMarkets(guild: string, oracle: string) {
+		return (await this.getGuildOpenMarkets(guild)).filter(
+			(m) => m.oracleUserId === oracle,
+		);
+	}
+	async getOrder(user: string, market: string): Promise<OrderRecord | null> {
+		return this.one(
+			"SELECT * FROM orders WHERE user_id=? AND market_id=?",
+			user,
+			market,
+		);
+	}
+	async getUserOrders(user: string): Promise<OrderRecord[]> {
+		return this.rows("SELECT * FROM orders WHERE user_id=?", user);
+	}
+	async getMarketOrders(market: string): Promise<OrderRecord[]> {
+		return this.rows(
+			"SELECT * FROM orders WHERE market_id=? ORDER BY created_at,id",
+			market,
+		);
+	}
+	async getPosition(user: string, market: string): Promise<Position | null> {
+		const p = await this.one(
+			"SELECT * FROM positions WHERE user_id=? AND market_id=?",
+			user,
+			market,
+		);
+		return p
+			? { userId: user, marketId: market, holdings: parseHoldings(p.holdings) }
+			: null;
+	}
+	async getUserPositions(
+		user: string,
+		guild?: string,
+	): Promise<UserPositionView[]> {
+		const rows = await this.rows(
+			`SELECT m.id AS market_id,COALESCE(p.holdings,'{}') AS holdings,m.number AS market_number,m.description AS market_description,m.status AS market_status FROM markets m LEFT JOIN positions p ON p.market_id=m.id AND p.user_id=? WHERE m.id IN (SELECT market_id FROM positions WHERE user_id=? UNION SELECT market_id FROM orders WHERE user_id=?) ${guild ? "AND m.guild_id=?" : ""} ORDER BY m.number DESC`,
+			user,
+			user,
+			user,
+			...(guild ? [guild] : []),
+		);
+		return Promise.all(
+			rows.map(async (p) => ({
+				...p,
+				holdings: parseHoldings(p.holdings),
+				order: await this.getOrder(user, p.marketId),
+			})),
+		);
+	}
+	async getUserMarketsWithOrders(user: string, guild: string) {
+		const orders = await this.getUserOrders(user);
+		const markets = await Promise.all(
+			orders.map((o) => this.getMarket(o.marketId)),
+		);
+		return markets.filter(
+			(m): m is MarketWithOutcomes => m !== null && m.guildId === guild,
+		);
+	}
+	async createOrder(
+		userId: string,
+		marketId: string,
+		outcomeId: string,
+		direction: Direction,
+		quantity: number,
+		priceUnits: number,
+		operationId?: string,
+	): Promise<CreateOrderResult> {
+		let quantityUnits: number;
+		try {
+			quantityUnits = contractsToShareUnits(quantity);
+		} catch {
+			return {
+				success: false,
+				error: "Quantity must be a positive safe integer",
+			};
+		}
+		const validation = validateOrder(direction, quantityUnits, priceUnits);
+		if (!validation.valid) return { success: false, error: validation.error };
+		return this.mutate(
+			"order-create",
+			{ userId, marketId, outcomeId, direction, quantity, priceUnits },
+			operationId,
+			async (s) => {
+				const m = await this.getMarket(marketId);
+				if (!m || m.status !== "open")
+					return { success: false, error: "Market not open" };
+				if (!m.outcomes.some((o) => o.id === outcomeId))
+					return { success: false, error: "Invalid outcome" };
+				if (await this.getOrder(userId, marketId))
+					return {
+						success: false,
+						error: "You already have an order in this market. Cancel it first.",
+					};
+				const participantCount = (
+					await this.one(
+						"SELECT count(DISTINCT user_id) AS count FROM (SELECT user_id FROM orders WHERE market_id=? UNION SELECT user_id FROM positions WHERE market_id=?)",
+						marketId,
+						marketId,
+					)
+				).count;
+				if (participantCount >= MAX_MARKET_PARTICIPANTS)
+					return { success: false, error: "Market participant limit reached" };
+				const holdings =
+					(await this.getPosition(userId, marketId))?.holdings ?? {};
+				const escrowUnits = calculateEscrow(
+					direction,
+					quantityUnits,
+					priceUnits,
+					holdings[outcomeId] ?? 0,
+				);
+				const b = await this.getBalance(userId);
+				if (b.availableUnits < escrowUnits)
+					return {
+						success: false,
+						error: `Insufficient balance. Need ${formatUnits(escrowUnits)}, have ${formatUnits(b.availableUnits)} available`,
+					};
+				const id = crypto.randomUUID();
+				const now = Date.now();
+				s.push(
+					this.sql(
+						"INSERT INTO users(discord_id) VALUES(?) ON CONFLICT DO NOTHING",
+						userId,
+					),
+					this.sql(
+						"UPDATE users SET locked_units=locked_units+? WHERE discord_id=? AND balance_units-locked_units>=?",
+						escrowUnits,
+						userId,
+						escrowUnits,
+					),
+					this.assertion("changes()=1"),
+				);
+				s.push(
+					this.sql(
+						"INSERT INTO orders VALUES(?,?,?,?,?,?,?,?,?)",
+						id,
+						userId,
+						marketId,
+						outcomeId,
+						direction,
+						quantityUnits,
+						priceUnits,
+						escrowUnits,
+						now,
+					),
+				);
+				return {
+					success: true,
+					order: {
+						id,
+						userId,
+						marketId,
+						outcomeId,
+						direction,
+						quantityUnits,
+						priceUnits,
+						escrowUnits,
+						createdAt: new Date(now),
+					},
+				};
+			},
+		);
+	}
+	async cancelOrder(userId: string, marketId: string, operationId?: string) {
+		return this.mutate(
+			"order-cancel",
+			{ userId, marketId },
+			operationId,
+			async (s) => {
+				const o = await this.getOrder(userId, marketId);
+				if (!o)
+					return { success: false, error: "No order found in this market" };
+				s.push(
+					this.sql(
+						"UPDATE users SET locked_units=locked_units-? WHERE discord_id=?",
+						o.escrowUnits,
+						userId,
+					),
+					this.assertion("changes()=1"),
+					this.sql("DELETE FROM orders WHERE id=?", o.id),
+					this.assertion("changes()=1"),
+				);
+				return { success: true };
+			},
+		);
+	}
+	async executeMarket(
+		marketId: string,
+		operationId?: string,
+	): Promise<{ executions: Execution[]; error?: string }> {
+		return this.mutate(
+			"market-execute",
+			{ marketId },
+			operationId,
+			async (s) => {
+				const m = await this.getMarket(marketId);
+				if (!m || m.status !== "open")
+					return { executions: [], error: "Market not open" };
+				const orders = await this.getMarketOrders(marketId);
+				const positions = await this.rows(
+					"SELECT * FROM positions WHERE market_id=?",
+					marketId,
+				);
+				const match = executeMatching(
+					orders,
+					positions.map((p) => ({
+						userId: p.userId,
+						marketId,
+						holdings: parseHoldings(p.holdings),
+					})),
+					m.outcomes.map((o) => o.id),
+					marketId,
+				);
+				let collateralDelta = 0;
+				for (const u of match.balanceUpdates) {
+					collateralDelta = addUnits(collateralDelta, -u.balanceUnitsDelta);
+					s.push(
+						this.sql(
+							"UPDATE users SET balance_units=balance_units+?,locked_units=locked_units+? WHERE discord_id=?",
+							u.balanceUnitsDelta,
+							u.lockedUnitsDelta,
+							u.userId,
+						),
+						this.assertion("changes()=1"),
+					);
+				}
+				if (collateralDelta < 0)
+					throw new Error("Matching creates unfunded currency");
+				s.push(
+					this.sql(
+						"UPDATE markets SET collateral_units=collateral_units+? WHERE id=?",
+						collateralDelta,
+						marketId,
+					),
+				);
+				const changed = new Map<string, Record<string, number>>();
+				for (const u of match.positionUpdates) {
+					const h =
+						changed.get(u.userId) ??
+						parseHoldings(
+							positions.find((p) => p.userId === u.userId)?.holdings ?? "{}",
+						);
+					h[u.outcomeId] = addUnits(h[u.outcomeId] ?? 0, u.quantityUnitsDelta);
+					if (h[u.outcomeId] === 0) delete h[u.outcomeId];
+					changed.set(u.userId, h);
+				}
+				for (const [user, h] of changed) {
+					const now = Date.now();
+					s.push(
+						this.sql(
+							"INSERT INTO positions VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,market_id) DO UPDATE SET holdings=excluded.holdings,updated_at=excluded.updated_at",
+							crypto.randomUUID(),
+							user,
+							marketId,
+							JSON.stringify(h),
+							now,
+							now,
+						),
+					);
+				}
+				for (const u of match.orderUpdates)
+					s.push(
+						u.newQuantityUnits === 0
+							? this.sql("DELETE FROM orders WHERE id=?", u.orderId)
+							: this.sql(
+									"UPDATE orders SET quantity_units=?,escrow_units=? WHERE id=?",
+									u.newQuantityUnits,
+									u.newEscrowUnits,
+									u.orderId,
+								),
+						this.assertion("changes()=1"),
+					);
+				for (const e of match.executions)
+					s.push(
+						this.sql(
+							"INSERT INTO executions VALUES(?,?,?,?)",
+							e.id,
+							marketId,
+							e.timestamp,
+							JSON.stringify(e.participants),
+						),
+					);
+				// Every outcome in an open market must have exactly the funded basket supply.
+				s.push(
+					this.assertion(
+						"NOT EXISTS(SELECT 1 FROM outcomes o WHERE o.market_id=? AND (SELECT collateral_units FROM markets WHERE id=?) != COALESCE((SELECT sum(j.value) FROM positions p,json_each(p.holdings) j WHERE p.market_id=? AND j.key=o.id),0))",
+						marketId,
+						marketId,
+						marketId,
+					),
+				);
+				return { executions: match.executions };
+			},
+		);
+	}
+	async resolveMarket(
+		marketId: string,
+		winningOutcomeId: string,
+		operationId?: string,
+	): Promise<ResolveMarketResult | null> {
+		return this.mutate(
+			"market-resolve",
+			{ marketId, winningOutcomeId },
+			operationId,
+			async (s) => {
+				const m = await this.getMarket(marketId);
+				if (
+					!m ||
+					m.status !== "open" ||
+					!m.outcomes.some((o) => o.id === winningOutcomeId)
+				)
+					return null;
+				const orders = await this.getMarketOrders(marketId);
+				const positions = await this.rows(
+					"SELECT * FROM positions WHERE market_id=?",
+					marketId,
+				);
+				const payouts: PayoutInfo[] = [];
+				const changes = new Map<string, { payout: number; unlock: number }>();
+				let totalPayoutUnits = 0;
+				for (const o of orders)
+					changes.set(o.userId, { payout: 0, unlock: o.escrowUnits });
+				for (const p of positions) {
+					const amount = parseHoldings(p.holdings)[winningOutcomeId] ?? 0;
+					if (amount) {
+						totalPayoutUnits = addUnits(totalPayoutUnits, amount);
+						payouts.push({
+							userId: p.userId,
+							shareUnits: amount,
+							payoutUnits: amount,
+						});
+						const c = changes.get(p.userId) ?? { payout: 0, unlock: 0 };
+						c.payout = amount;
+						changes.set(p.userId, c);
+					}
+				}
+				if (totalPayoutUnits !== m.collateralUnits)
+					throw new Error(
+						"Settlement collateral does not match winning supply",
+					);
+				for (const [user, c] of changes)
+					s.push(
+						this.sql(
+							"UPDATE users SET balance_units=balance_units+?,locked_units=locked_units-? WHERE discord_id=?",
+							c.payout,
+							c.unlock,
+							user,
+						),
+						this.assertion("changes()=1"),
+					);
+				s.push(
+					this.sql("DELETE FROM orders WHERE market_id=?", marketId),
+					this.sql("DELETE FROM positions WHERE market_id=?", marketId),
+				);
+				const now = Date.now();
+				s.push(
+					this.sql(
+						"UPDATE markets SET status='resolved',winning_outcome_id=?,resolved_at=?,collateral_units=0 WHERE id=? AND status='open'",
+						winningOutcomeId,
+						now,
+						marketId,
+					),
+					this.assertion("changes()=1"),
+				);
+				return {
+					market: {
+						...m,
+						status: "resolved",
+						winningOutcomeId,
+						resolvedAt: new Date(now),
+						collateralUnits: 0,
+					},
+					payouts,
+					totalPayoutUnits,
+					winnerCount: payouts.length,
+				};
+			},
+		);
+	}
+	async getOrCreateChannelProgress(
+		guildId: string,
+		channelId: string,
+	): Promise<BackfillProgressRecord> {
+		const p = await this.one(
+			"SELECT * FROM backfill_progress WHERE guild_id=? AND channel_id=?",
+			guildId,
+			channelId,
+		);
+		if (p) return p;
+		await this.mutate(
+			"backfill-init",
+			{ guildId, channelId },
+			undefined,
+			async (s) => {
+				s.push(
+					this.sql(
+						"INSERT INTO backfill_progress(guild_id,channel_id,updated_at) VALUES(?,?,?) ON CONFLICT DO NOTHING",
+						guildId,
+						channelId,
+						Date.now(),
+					),
+				);
+				return true;
+			},
+		);
+		const created = await this.one(
+			"SELECT * FROM backfill_progress WHERE guild_id=? AND channel_id=?",
+			guildId,
+			channelId,
+		);
+		if (!created) throw new Error("Backfill progress disappeared");
+		return created;
+	}
+	async getGuildBackfillProgress(
+		guild: string,
+	): Promise<BackfillProgressRecord[]> {
+		return this.rows("SELECT * FROM backfill_progress WHERE guild_id=?", guild);
+	}
+	async updateChannelProgress(
+		guild: string,
+		channel: string,
+		last: string,
+		messages: number,
+		reactions: number,
+		operationId?: string,
+	) {
+		await this.mutate(
+			"backfill-update",
+			{ guild, channel, last, messages, reactions },
+			operationId,
+			async (s) => {
+				s.push(
+					this.sql(
+						"UPDATE backfill_progress SET last_message_id=?,messages_processed=messages_processed+?,reactions_added=reactions_added+?,status='in_progress',updated_at=? WHERE guild_id=? AND channel_id=?",
+						last,
+						messages,
+						reactions,
+						Date.now(),
+						guild,
+						channel,
+					),
+					this.assertion("changes()=1"),
+				);
+				return true;
+			},
+		);
+	}
+	async markChannelCompleted(guild: string, channel: string) {
+		await this.mutate(
+			"backfill-complete",
+			{ guild, channel },
+			undefined,
+			async (s) => {
+				s.push(
+					this.sql(
+						"UPDATE backfill_progress SET status='completed',updated_at=? WHERE guild_id=? AND channel_id=?",
+						Date.now(),
+						guild,
+						channel,
+					),
+				);
+				return true;
+			},
+		);
+	}
+	async resetStaleProgress(guild: string) {
+		await this.mutate("backfill-stale", { guild }, undefined, async (s) => {
+			s.push(
+				this.sql(
+					"UPDATE backfill_progress SET status='pending',updated_at=? WHERE guild_id=? AND status='in_progress' AND updated_at<?",
+					Date.now(),
+					guild,
+					Date.now() - 3600000,
+				),
+			);
+			return true;
+		});
+	}
+	async resetGuildBackfillProgress(guild: string) {
+		await this.mutate("backfill-reset", { guild }, undefined, async (s) => {
+			s.push(this.sql("DELETE FROM backfill_progress WHERE guild_id=?", guild));
+			return true;
+		});
+	}
 }

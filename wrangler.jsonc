@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hypehedge", "main": "src/cloudflare/worker.ts",
+  "compatibility_date": "2026-10-06",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {"CLIENT_ID": "REPLACE_WITH_APPLICATION_ID", "DISCORD_PUBLIC_KEY": "REPLACE_WITH_PUBLIC_KEY"},
+  "d1_databases": [{"binding": "DB", "database_name": "hypehedge", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations"}],
+  "durable_objects": {"bindings": [{"name": "GATEWAY", "class_name": "GatewayDO"}]},
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["GatewayDO"]}],
+  "triggers": {"crons": ["*/5 * * * *"]}
+}
