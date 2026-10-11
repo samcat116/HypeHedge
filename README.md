@@ -80,6 +80,9 @@ Recovery disconnects preserve Discord resume sessions, while terminal shutdown
 invalidates them. Gateway upgrade requests use HTTPS URLs, as required by workerd.
 Concurrent scheduling retains the earliest alarm deadline, so sustained intake
 cannot postpone a queued drain.
+Alarm drains use bounded fair progress across commands, replies, ordered live
+events and backfills. Terminal Discord close codes disable the Gateway and record
+an observable failure; recovery codes reconnect according to session validity.
 Backfill uses persisted bounded cursors: at most 500 channels, 1,000 messages
 per channel, and 10,000 users per reaction. Reaching an oversized scan boundary
 records an observable partial-scan failure; no further page is processed.
@@ -101,6 +104,21 @@ observable in object status. Operator inspection uses the internal `/status` bin
 route. Receipts and reaction history grow with activity; monitor D1 size and quotas.
 
 ## Account-wide free-tier tradeoffs
+
+The application conservatively budgets at most 50 logical D1 SQL statements per
+HTTP or alarm invocation, including reads, every batch statement and retries.
+Atomic batches are refused before execution when the remaining budget is too small;
+durable work resumes in a fresh alarm. Reaction-page cursors retain partial progress.
+Matching and settlement use set-based SQL so their cost does not grow with the
+80-participant bound; collection reads avoid per-record queries.
+At that bound, tested command paths use 17 statements for settlement including
+authorization reads, and 37 for order creation plus matching. Contention can yield
+between those receipt-backed operations; it does not split an atomic ledger batch.
+[D1 limits](https://developers.cloudflare.com/d1/platform/limits/) list 50 queries
+on Free, while the [workerd binding](https://github.com/cloudflare/workerd/blob/main/src/cloudflare/internal/d1-api.ts)
+sends a SQL batch in one service request. This statement budget is deliberately
+conservative, not a claim about hosted subrequest metering. Local workerd tests
+exercise the application budget; they do not reproduce hosted quota enforcement.
 
 An outbound Discord WebSocket cannot use Durable Object hibernation. The heartbeat
 keeps this object active. At 128 MB, a continuously active object uses about

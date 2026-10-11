@@ -1,3 +1,4 @@
+import { D1QueryBudget } from "./d1-budget";
 import {
 	type DiscordInteraction,
 	type InteractionEnv,
@@ -98,7 +99,8 @@ export default {
 		).fetch("https://gateway/recover", { method: "POST" });
 		if (!response.ok) throw new Error("Gateway recovery unavailable");
 	},
-	async fetch(request: Request, env: InteractionEnv): Promise<Response> {
+	async fetch(request: Request, bindings: InteractionEnv): Promise<Response> {
+		const env = { ...bindings, DB: new D1QueryBudget().wrap(bindings.DB) };
 		const deadline = Date.now() + 2400;
 		const url = new URL(request.url);
 		if (url.pathname !== "/interactions" || request.method !== "POST")

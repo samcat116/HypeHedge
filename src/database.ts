@@ -6,6 +6,7 @@ import {
 	formatUnits,
 	parseHoldings,
 } from "./accounting.js";
+import { D1QueryBudgetExceeded } from "./cloudflare/d1-budget.js";
 import {
 	type Direction,
 	type Execution,
@@ -185,6 +186,7 @@ export class Database {
 			try {
 				result = await build(statements);
 			} catch (error) {
+				if (error instanceof D1QueryBudgetExceeded) throw error;
 				if (
 					(await this.one("SELECT version FROM revision WHERE id=1"))
 						.version !== revision.version
@@ -216,6 +218,7 @@ export class Database {
 				await this.db.batch(batch);
 				return result;
 			} catch (error) {
+				if (error instanceof D1QueryBudgetExceeded) throw error;
 				// Only stale snapshot/competing identical operation is retried. Real SQL or
 				// invariant failures are visible rather than hidden behind generic retries.
 				const latest = await this.one(
@@ -431,23 +434,32 @@ export class Database {
 		});
 	}
 	async getMarket(id: string): Promise<MarketWithOutcomes | null> {
-		const m = await this.one("SELECT * FROM markets WHERE id=?", id);
-		if (!m) return null;
-		return {
-			...m,
-			outcomes: await this.rows(
-				"SELECT * FROM outcomes WHERE market_id=? ORDER BY number",
-				id,
-			),
-		};
+		return (await this.projectMarkets("m.id=?", [id]))[0] ?? null;
+	}
+	/** Project outcomes in the same SQL statement rather than one D1 call per market. */
+	private async projectMarkets(
+		where: string,
+		args: unknown[],
+		suffix = "",
+	): Promise<MarketWithOutcomes[]> {
+		const rows = await this.rows(
+			`SELECT m.*,(SELECT json_group_array(json_object('id',o.id,'marketId',o.market_id,'number',o.number,'description',o.description)) FROM (SELECT * FROM outcomes WHERE market_id=m.id ORDER BY number) o) AS outcomes_json FROM markets m WHERE ${where} ${suffix}`,
+			...args,
+		);
+		return rows.map(
+			({ outcomesJson, ...market }) =>
+				({
+					...market,
+					outcomes: JSON.parse(outcomesJson),
+				}) as MarketWithOutcomes,
+		);
 	}
 	async getMarketByNumber(guild: string, n: number) {
-		const m = await this.one(
-			"SELECT id FROM markets WHERE guild_id=? AND number=?",
-			guild,
-			n,
+		return (
+			(
+				await this.projectMarkets("m.guild_id=? AND m.number=?", [guild, n])
+			)[0] ?? null
 		);
-		return m ? this.getMarket(m.id) : null;
 	}
 	async getGuildMarketsPaginated(
 		guild: string,
@@ -457,11 +469,10 @@ export class Database {
 	): Promise<PaginatedMarkets> {
 		const where = status ? "guild_id=? AND status=?" : "guild_id=?";
 		const args = status ? [guild, status] : [guild];
-		const rows = await this.rows(
-			`SELECT id FROM markets WHERE ${where} ORDER BY number DESC LIMIT ? OFFSET ?`,
-			...args,
-			pageSize,
-			page * pageSize,
+		const markets = await this.projectMarkets(
+			where,
+			[...args, pageSize, page * pageSize],
+			"ORDER BY m.number DESC LIMIT ? OFFSET ?",
 		);
 		const totalCount = (
 			await this.one(
@@ -470,9 +481,7 @@ export class Database {
 			)
 		).count;
 		return {
-			markets: (await Promise.all(
-				rows.map((m) => this.getMarket(m.id)),
-			)) as MarketWithOutcomes[],
+			markets,
 			totalCount,
 			hasMore: (page + 1) * pageSize < totalCount,
 		};
@@ -481,8 +490,10 @@ export class Database {
 		return (await this.getGuildMarketsPaginated(guild, 0, 100, "open")).markets;
 	}
 	async getOracleOpenMarkets(guild: string, oracle: string) {
-		return (await this.getGuildOpenMarkets(guild)).filter(
-			(m) => m.oracleUserId === oracle,
+		return this.projectMarkets(
+			"m.guild_id=? AND m.status='open' AND m.oracle_user_id=?",
+			[guild, oracle],
+			"ORDER BY m.number DESC",
 		);
 	}
 	async getOrder(user: string, market: string): Promise<OrderRecord | null> {
@@ -516,27 +527,26 @@ export class Database {
 		guild?: string,
 	): Promise<UserPositionView[]> {
 		const rows = await this.rows(
-			`SELECT m.id AS market_id,COALESCE(p.holdings,'{}') AS holdings,m.number AS market_number,m.description AS market_description,m.status AS market_status FROM markets m LEFT JOIN positions p ON p.market_id=m.id AND p.user_id=? WHERE m.id IN (SELECT market_id FROM positions WHERE user_id=? UNION SELECT market_id FROM orders WHERE user_id=?) ${guild ? "AND m.guild_id=?" : ""} ORDER BY m.number DESC`,
-			user,
+			`SELECT m.id AS market_id,COALESCE(p.holdings,'{}') AS holdings,m.number AS market_number,m.description AS market_description,m.status AS market_status,CASE WHEN o.id IS NULL THEN NULL ELSE json_object('id',o.id,'userId',o.user_id,'marketId',o.market_id,'outcomeId',o.outcome_id,'direction',o.direction,'quantityUnits',o.quantity_units,'priceUnits',o.price_units,'escrowUnits',o.escrow_units,'createdAt',o.created_at) END AS order_json FROM markets m LEFT JOIN positions p ON p.market_id=m.id AND p.user_id=? LEFT JOIN orders o ON o.market_id=m.id AND o.user_id=? WHERE (p.id IS NOT NULL OR o.id IS NOT NULL) ${guild ? "AND m.guild_id=?" : ""} ORDER BY m.number DESC`,
 			user,
 			user,
 			...(guild ? [guild] : []),
 		);
-		return Promise.all(
-			rows.map(async (p) => ({
+		return rows.map(({ orderJson, ...p }) => {
+			const order = orderJson ? JSON.parse(orderJson) : null;
+			if (order) order.createdAt = new Date(order.createdAt);
+			return {
 				...p,
 				holdings: parseHoldings(p.holdings),
-				order: await this.getOrder(user, p.marketId),
-			})),
-		);
+				order,
+			} as UserPositionView;
+		});
 	}
 	async getUserMarketsWithOrders(user: string, guild: string) {
-		const orders = await this.getUserOrders(user);
-		const markets = await Promise.all(
-			orders.map((o) => this.getMarket(o.marketId)),
-		);
-		return markets.filter(
-			(m): m is MarketWithOutcomes => m !== null && m.guildId === guild,
+		return this.projectMarkets(
+			"m.guild_id=? AND EXISTS(SELECT 1 FROM orders o WHERE o.market_id=m.id AND o.user_id=?)",
+			[guild, user],
+			"ORDER BY m.number DESC",
 		);
 	}
 	async createOrder(
@@ -696,16 +706,22 @@ export class Database {
 				let collateralDelta = 0;
 				for (const u of match.balanceUpdates) {
 					collateralDelta = addUnits(collateralDelta, -u.balanceUnitsDelta);
+				}
+				if (match.balanceUpdates.length)
 					s.push(
 						this.sql(
-							"UPDATE users SET balance_units=balance_units+?,locked_units=locked_units+? WHERE discord_id=?",
-							u.balanceUnitsDelta,
-							u.lockedUnitsDelta,
-							u.userId,
+							`WITH updates AS (
+                          SELECT json_extract(value,'$.userId') AS user,
+                                 json_extract(value,'$.balanceUnitsDelta') AS balance_delta,
+                                 json_extract(value,'$.lockedUnitsDelta') AS locked_delta FROM json_each(?)
+                        ) UPDATE users SET
+                          balance_units=balance_units+(SELECT balance_delta FROM updates WHERE user=discord_id),
+                          locked_units=locked_units+(SELECT locked_delta FROM updates WHERE user=discord_id)
+                        WHERE discord_id IN (SELECT user FROM updates)`,
+							JSON.stringify(match.balanceUpdates),
 						),
-						this.assertion("changes()=1"),
+						this.assertion("changes()=?", match.balanceUpdates.length),
 					);
-				}
 				if (collateralDelta < 0)
 					throw new Error("Matching creates unfunded currency");
 				s.push(
@@ -726,41 +742,66 @@ export class Database {
 					if (h[u.outcomeId] === 0) delete h[u.outcomeId];
 					changed.set(u.userId, h);
 				}
-				for (const [user, h] of changed) {
-					const now = Date.now();
+				if (changed.size) {
 					s.push(
 						this.sql(
-							"INSERT INTO positions VALUES(?,?,?,?,?,?) ON CONFLICT(user_id,market_id) DO UPDATE SET holdings=excluded.holdings,updated_at=excluded.updated_at",
-							crypto.randomUUID(),
-							user,
+							`INSERT INTO positions(id,user_id,market_id,holdings,created_at,updated_at)
+                          SELECT json_extract(value,'$.id'),json_extract(value,'$.user'),?,
+                                 json_extract(value,'$.holdings'),?,? FROM json_each(?) WHERE true
+                          ON CONFLICT(user_id,market_id) DO UPDATE SET holdings=excluded.holdings,updated_at=excluded.updated_at`,
 							marketId,
-							JSON.stringify(h),
-							now,
-							now,
+							Date.now(),
+							Date.now(),
+							JSON.stringify(
+								[...changed].map(([user, h]) => ({
+									id: crypto.randomUUID(),
+									user,
+									holdings: JSON.stringify(h),
+								})),
+							),
 						),
+						this.assertion("changes()=?", changed.size),
 					);
 				}
-				for (const u of match.orderUpdates)
-					s.push(
-						u.newQuantityUnits === 0
-							? this.sql("DELETE FROM orders WHERE id=?", u.orderId)
-							: this.sql(
-									"UPDATE orders SET quantity_units=?,escrow_units=? WHERE id=?",
-									u.newQuantityUnits,
-									u.newEscrowUnits,
-									u.orderId,
-								),
-						this.assertion("changes()=1"),
-					);
-				for (const e of match.executions)
+				const removed = match.orderUpdates.filter(
+					(u) => u.newQuantityUnits === 0,
+				);
+				const remaining = match.orderUpdates.filter(
+					(u) => u.newQuantityUnits > 0,
+				);
+				if (removed.length)
 					s.push(
 						this.sql(
-							"INSERT INTO executions VALUES(?,?,?,?)",
-							e.id,
-							marketId,
-							e.timestamp,
-							JSON.stringify(e.participants),
+							"DELETE FROM orders WHERE id IN (SELECT value FROM json_each(?))",
+							JSON.stringify(removed.map((u) => u.orderId)),
 						),
+						this.assertion("changes()=?", removed.length),
+					);
+				if (remaining.length)
+					s.push(
+						this.sql(
+							`WITH updates AS (
+                          SELECT json_extract(value,'$.orderId') AS id,
+                                 json_extract(value,'$.newQuantityUnits') AS quantity,
+                                 json_extract(value,'$.newEscrowUnits') AS escrow FROM json_each(?)
+                        ) UPDATE orders SET
+                          quantity_units=(SELECT quantity FROM updates WHERE updates.id=orders.id),
+                          escrow_units=(SELECT escrow FROM updates WHERE updates.id=orders.id)
+                        WHERE id IN (SELECT id FROM updates)`,
+							JSON.stringify(remaining),
+						),
+						this.assertion("changes()=?", remaining.length),
+					);
+				if (match.executions.length)
+					s.push(
+						this.sql(
+							`INSERT INTO executions(id,market_id,timestamp,participants)
+                        SELECT json_extract(value,'$.id'),?,json_extract(value,'$.timestamp'),json_extract(value,'$.participants')
+                        FROM json_each(?)`,
+							marketId,
+							JSON.stringify(match.executions),
+						),
+						this.assertion("changes()=?", match.executions.length),
 					);
 				// Every outcome in an open market must have exactly the funded basket supply.
 				s.push(
@@ -820,16 +861,23 @@ export class Database {
 					throw new Error(
 						"Settlement collateral does not match winning supply",
 					);
-				for (const [user, c] of changes)
-					s.push(
-						this.sql(
-							"UPDATE users SET balance_units=balance_units+?,locked_units=locked_units-? WHERE discord_id=?",
-							c.payout,
-							c.unlock,
-							user,
-						),
-						this.assertion("changes()=1"),
-					);
+				// One JSON parameter keeps 80 users below D1's 100-parameter limit.
+				// SQLite checks each user's exact integer balance/lock constraints;
+				// the affected-count assertion aborts the entire batch if any user is missing.
+				s.push(
+					this.sql(
+						`WITH settlement AS (
+                          SELECT json_extract(value,'$.user') AS user,
+                                 json_extract(value,'$.payout') AS payout,
+                                 json_extract(value,'$.unlock') AS unlock FROM json_each(?)
+                        ) UPDATE users SET
+                          balance_units=balance_units+(SELECT payout FROM settlement WHERE user=discord_id),
+                          locked_units=locked_units-(SELECT unlock FROM settlement WHERE user=discord_id)
+                        WHERE discord_id IN (SELECT user FROM settlement)`,
+						JSON.stringify([...changes].map(([user, c]) => ({ user, ...c }))),
+					),
+					this.assertion("changes()=?", changes.size),
+				);
 				s.push(
 					this.sql("DELETE FROM orders WHERE market_id=?", marketId),
 					this.sql("DELETE FROM positions WHERE market_id=?", marketId),

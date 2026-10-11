@@ -1,4 +1,5 @@
 import { Database } from "../database";
+import { D1QueryBudget, D1QueryBudgetExceeded } from "./d1-budget";
 import { type MessagePayload, executeInteraction } from "./interactions";
 
 // biome-ignore lint/suspicious/noExplicitAny: Discord Gateway wire JSON is validated per event at the boundary.
@@ -43,6 +44,9 @@ interface Backfill {
 	reactionIndex?: number;
 	userAfter?: string;
 	userPages?: number;
+	usersProcessed?: number;
+	usersPage?: DiscordData[];
+	userIndex?: number;
 }
 interface BackfillAdmission {
 	guildId: string;
@@ -52,6 +56,9 @@ interface BackfillAdmission {
 }
 type BackfillAdmissionResult = "accepted" | "conflict" | "full";
 const MAX_QUEUE = 512;
+const JOB_LANES: Job["kind"][] = ["event", "command", "reply", "backfill"];
+// Discord marks these close codes as non-reconnectable.
+const TERMINAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const INTENTS = 1 | 512 | 1024; // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS
 
 /** Workers fetch upgrades use HTTP(S), even when Discord returns a WSS URL. */
@@ -296,28 +303,116 @@ export class GatewayDO {
 				prefix: "job:",
 				limit: MAX_QUEUE,
 			});
+			const invocationBudget = new D1QueryBudget();
+			const invocationEnv = {
+				...this.env,
+				DB: invocationBudget.wrap(this.env.DB),
+			};
+			const lanes = new Map<Job["kind"], Array<[string, Job]>>(
+				JOB_LANES.map((kind) => [
+					kind,
+					[...jobs].filter(([, job]) => job.kind === kind),
+				]),
+			);
+			// Rotate each non-event lane across alarms so persistent backfills also make progress.
+			for (const kind of JOB_LANES) {
+				if (kind === "event") continue;
+				const entries = lanes.get(kind) ?? [];
+				const last = await this.state.storage.get<string>(
+					`scheduler-last:${kind}`,
+				);
+				if (last) {
+					const pivot = entries.findIndex(([key]) => key > last);
+					if (pivot > 0)
+						lanes.set(kind, [
+							...entries.slice(pivot),
+							...entries.slice(0, pivot),
+						]);
+				}
+			}
+			let lane = (await this.state.storage.get<number>("scheduler-lane")) ?? 0;
+			const priority = await this.state.storage.get<{
+				key: string;
+				kind: Job["kind"];
+				generation?: string;
+			}>("scheduler-priority");
+			let priorityKey: string | undefined;
+			if (priority) {
+				const entries = lanes.get(priority.kind) ?? [];
+				const index = entries.findIndex(
+					([key, job]) =>
+						key === priority.key &&
+						(priority.generation === undefined ||
+							job.data.scanId === priority.generation),
+				);
+				if (index >= 0) {
+					priorityKey = priority.key;
+					lane = JOB_LANES.indexOf(priority.kind);
+					if (priority.kind !== "event")
+						lanes.set(priority.kind, [
+							entries[index],
+							...entries.filter((_, position) => position !== index),
+						]);
+				} else await this.state.storage.delete("scheduler-priority");
+			}
 			let processed = 0;
-			// Event IDs contain zero-padded sequence numbers. Never overtake a failed event.
+			// The event lane always takes its captured FIFO head; a delay/failure blocks its tail.
 			let blockedEvents = false;
-			for (const [key, job] of jobs) {
-				if (processed >= 16) break;
-				if (job.kind === "event" && blockedEvents) continue;
+			while (processed < 16) {
 				if (
-					job.due > Date.now() ||
 					((await this.state.storage.get<number>("restPause")) ?? 0) >
-						Date.now()
-				) {
-					if (job.kind === "event") blockedEvents = true;
-					continue;
+					Date.now()
+				)
+					break;
+				let selected: [string, Job] | undefined;
+				for (let checked = 0; checked < JOB_LANES.length; checked++) {
+					const kind = JOB_LANES[lane];
+					lane = (lane + 1) % JOB_LANES.length;
+					if (kind === "event" && blockedEvents) continue;
+					const entries = lanes.get(kind) ?? [];
+					if (kind === "event") {
+						if (entries[0]?.[1].due > Date.now()) {
+							blockedEvents = true;
+							continue;
+						}
+						selected = entries.shift();
+					} else {
+						const ready = entries.findIndex(([, job]) => job.due <= Date.now());
+						if (ready >= 0) selected = entries.splice(ready, 1)[0];
+					}
+					if (selected) break;
+				}
+				if (!selected) break;
+				const [key, job] = selected;
+				if (key === priorityKey) {
+					await this.state.storage.delete("scheduler-priority");
+					priorityKey = undefined;
 				}
 				if (!(await this.currentGeneration(job))) continue;
+				const startUsed = invocationBudget.used;
+				await this.state.storage.put({
+					"scheduler-lane": lane,
+					[`scheduler-last:${job.kind}`]: key,
+				});
 				const generation =
 					job.kind === "backfill" ? (job.data.scanId as string) : undefined;
 				processed++;
 				try {
-					const complete = await this.process(job);
+					const complete = await this.process(job, invocationEnv);
 					await this.saveJob(key, job, complete, generation);
 				} catch (error) {
+					if (error instanceof D1QueryBudgetExceeded) {
+						// A job denied a fresh budget retries the same key, not merely its lane.
+						// A page that already started with a fresh budget yields its turn to other lanes.
+						if (startUsed > 0 && !priorityKey)
+							await this.state.storage.put({
+								"scheduler-lane": JOB_LANES.indexOf(job.kind),
+								"scheduler-priority": { key, kind: job.kind, generation },
+							});
+						job.due = Date.now() + 1000;
+						await this.saveJob(key, job, false, generation);
+						break;
+					}
 					if (error instanceof BackfillLimit) {
 						await this.failure(error.message);
 						await this.saveJob(key, job, true, generation);
@@ -409,10 +504,10 @@ export class GatewayDO {
 			const closed = (event: CloseEvent | Event) => {
 				if (this.socket === socket) {
 					const code = "code" in event ? event.code : 0;
-					this.disconnect(code !== 4004 && code !== 4014);
+					this.disconnect(!TERMINAL_CLOSE_CODES.has(code));
 					this.state.waitUntil(
 						this.capture(async () => {
-							if (code === 4004 || code === 4014) {
+							if (TERMINAL_CLOSE_CODES.has(code)) {
 								await this.state.storage.put("enabled", false);
 								await this.failure(`Fatal Gateway close ${code}`);
 							} else {
@@ -582,8 +677,11 @@ export class GatewayDO {
 		if (!response.ok) throw new RestError(response.status);
 		return response.status === 204 ? null : response.json();
 	}
-	private async process(job: Job): Promise<boolean> {
-		const db = new Database(this.env.DB);
+	private async process(
+		job: Job,
+		env: GatewayEnv = this.env,
+	): Promise<boolean> {
+		const db = new Database(env.DB);
 		if (job.kind === "event") {
 			const frame = job.data as Frame;
 			const d = frame.d;
@@ -615,7 +713,7 @@ export class GatewayDO {
 		if (job.kind === "command") {
 			let data: MessagePayload;
 			try {
-				data = await executeInteraction(job.data, this.env, async (input) => {
+				data = await executeInteraction(job.data, env, async (input) => {
 					const result = await this.admitBackfill({
 						...input,
 						interactionId: job.data.id,
@@ -662,6 +760,9 @@ export class GatewayDO {
 		data.reactionIndex = undefined;
 		data.userAfter = undefined;
 		data.userPages = undefined;
+		data.usersProcessed = undefined;
+		data.usersPage = undefined;
+		data.userIndex = undefined;
 	}
 	private finishMessage(data: Backfill) {
 		data.scanned++;
@@ -670,6 +771,9 @@ export class GatewayDO {
 		data.reactionIndex = undefined;
 		data.userAfter = undefined;
 		data.userPages = undefined;
+		data.usersProcessed = undefined;
+		data.usersPage = undefined;
+		data.userIndex = undefined;
 		if (data.scanned >= data.limit) this.advanceChannel(data);
 	}
 
@@ -721,13 +825,24 @@ export class GatewayDO {
 					? `${reaction.emoji.name}:${reaction.emoji.id}`
 					: emoji;
 				stage = "message reaction enumeration";
-				const users = await this.api(
-					`/channels/${channel}/messages/${message.id}/reactions/${encodeURIComponent(pathEmoji)}?limit=100${data.userAfter ? `&after=${data.userAfter}` : ""}`,
-				);
+				if (!data.usersPage) {
+					data.usersPage = await this.api(
+						`/channels/${channel}/messages/${message.id}/reactions/${encodeURIComponent(pathEmoji)}?limit=100${data.userAfter ? `&after=${data.userAfter}` : ""}`,
+					);
+					data.userIndex = 0;
+				}
+				const users = data.usersPage;
+				if (!Array.isArray(users))
+					throw new Error("Invalid Discord reaction user page");
 				if (!(await this.currentGeneration(job))) return true;
-				for (const user of users)
-					if (!user.bot && user.id !== message.author.id) {
-						if (!(await this.currentGeneration(job))) return true;
+				for (let index = data.userIndex ?? 0; index < users.length; index++) {
+					if ((data.usersProcessed ?? 0) >= 10000)
+						throw new BackfillLimit(
+							"Backfill partial: reaction exceeds 10000-user limit",
+						);
+					if (!(await this.currentGeneration(job))) return true;
+					const user = users[index];
+					if (!user.bot && user.id !== message.author.id)
 						await db.addReaction(
 							message.id,
 							user.id,
@@ -735,7 +850,13 @@ export class GatewayDO {
 							emoji,
 							`backfill:${data.scanId}:${message.id}:${user.id}:${emoji}`,
 						);
-					}
+					// Advance only after the idempotent award resolves. Persist this captured page on budget yield.
+					data.userIndex = index + 1;
+					data.userAfter = user.id;
+					data.usersProcessed = (data.usersProcessed ?? 0) + 1;
+				}
+				data.usersPage = undefined;
+				data.userIndex = undefined;
 				data.userPages = (data.userPages ?? 0) + 1;
 				if (users.length === 100) {
 					data.userAfter = users.at(-1).id;
@@ -748,6 +869,7 @@ export class GatewayDO {
 					data.reactionIndex = (data.reactionIndex ?? 0) + 1;
 					data.userAfter = undefined;
 					data.userPages = 0;
+					data.usersProcessed = 0;
 				}
 			} else {
 				data.scanned++;
