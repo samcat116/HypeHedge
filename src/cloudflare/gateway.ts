@@ -32,6 +32,16 @@ interface Job {
 	attempts: number;
 	due: number;
 }
+interface CommandRecord {
+	time: number;
+	payload: string;
+	result?: MessagePayload;
+	delivery?: "pending" | "delivered" | "expired" | "unavailable";
+}
+type CommandAdmission =
+	| { state: "pending" }
+	| { state: "completed"; payload: MessagePayload }
+	| { state: "full" | "conflict" | "expired" };
 interface Backfill {
 	scanId: string;
 	guildId: string;
@@ -56,6 +66,7 @@ interface BackfillAdmission {
 }
 type BackfillAdmissionResult = "accepted" | "conflict" | "full";
 const MAX_QUEUE = 512;
+const MAX_COMMAND_RECORDS = 4096;
 const JOB_LANES: Job["kind"][] = ["event", "command", "reply", "backfill"];
 // Discord marks these close codes as non-reconnectable.
 const TERMINAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
@@ -135,22 +146,22 @@ export class GatewayDO {
 					typeof interaction.token !== "string"
 				)
 					return new Response("Invalid interaction", { status: 400 });
-				const id = `command:${interaction.id}`;
+				const result = await this.admitCommand(interaction);
 				if (
-					!(await this.enqueue(
-						{
-							kind: "command",
-							data: interaction,
-							id,
-							attempts: 0,
-							due: Date.now(),
-						},
-						true,
-					))
+					result.state === "full" ||
+					result.state === "conflict" ||
+					result.state === "expired"
 				)
-					return new Response("Queue full", { status: 503 });
-				await this.schedule();
-				return new Response("Captured");
+					return Response.json(result, {
+						status:
+							result.state === "full"
+								? 503
+								: result.state === "conflict"
+									? 409
+									: 410,
+					});
+				if (result.state === "pending") await this.schedule();
+				return Response.json(result);
 			}
 			if (path === "/backfill") {
 				const data = (await request.json()) as DiscordData;
@@ -256,30 +267,69 @@ export class GatewayDO {
 				if (current?.kind !== "backfill" || current.data.scanId !== generation)
 					return;
 			}
+			if (job.kind === "reply") {
+				const recordKey = `seen:${job.id}`;
+				const record = await tx.get<CommandRecord>(recordKey);
+				if (record)
+					await tx.put(recordKey, {
+						...record,
+						result: job.data.payload,
+						delivery: job.data.delivery ?? (complete ? "delivered" : "pending"),
+					} satisfies CommandRecord);
+			}
 			if (complete) await tx.delete(key);
 			else await tx.put(key, job);
 		});
 	}
 
-	private async enqueue(job: Job, remember = false): Promise<boolean> {
+	private async admitCommand(
+		interaction: DiscordData,
+	): Promise<CommandAdmission> {
+		const id = `command:${interaction.id}`;
+		const payload = JSON.stringify(interaction);
 		return this.state.storage.transaction(async (tx) => {
-			if (remember) {
-				const seen = await tx.get<{ time: number; payload: string }>(
-					`seen:${job.id}`,
-				);
-				if (seen) return seen.payload === JSON.stringify(job.data);
+			const key = `seen:${id}`;
+			const record = await tx.get<CommandRecord>(key);
+			if (record) {
+				if (record.payload !== payload) return { state: "conflict" };
+				if (record.result)
+					return { state: "completed", payload: record.result };
+				const existing = await tx.get<Job>(`job:${id}`);
+				if (existing) return { state: "pending" };
+				// A receipt without a job/result must never acknowledge work that cannot run.
+				return {
+					state: "completed",
+					payload: {
+						content:
+							"This interaction has already been processed; its response is unavailable.",
+						allowed_mentions: { parse: [] },
+					},
+				};
 			}
+			// An orphaned job has no authenticated original payload to compare; preserve it.
+			if (await tx.get(`job:${id}`)) return { state: "conflict" };
+			const createdAt = Number(BigInt(interaction.id) >> 22n) + 1420070400000;
+			if (
+				createdAt < Date.now() - 15 * 60 * 1000 ||
+				createdAt > Date.now() + 300000
+			)
+				return { state: "expired" };
 			if (
 				(await tx.list({ prefix: "job:", limit: MAX_QUEUE })).size >= MAX_QUEUE
 			)
-				return false;
-			await tx.put(`job:${job.id}`, job);
-			if (remember)
-				await tx.put(`seen:${job.id}`, {
-					time: Date.now(),
-					payload: JSON.stringify(job.data),
-				});
-			return true;
+				return { state: "full" };
+			const recordCount = (await tx.get<number>("command-record-count")) ?? 0;
+			if (recordCount >= MAX_COMMAND_RECORDS) return { state: "full" };
+			await tx.put("command-record-count", recordCount + 1);
+			await tx.put(`job:${id}`, {
+				kind: "command",
+				data: interaction,
+				id,
+				attempts: 0,
+				due: Date.now(),
+			} satisfies Job);
+			await tx.put(key, { time: Date.now(), payload } satisfies CommandRecord);
+			return { state: "pending" };
 		});
 	}
 	private async schedule(delay = 1000) {
@@ -430,6 +480,7 @@ export class GatewayDO {
 						(error.status === 403 || error.status === 404) &&
 						(job.kind === "event" || job.kind === "reply")
 					) {
+						if (job.kind === "reply") job.data.delivery = "unavailable";
 						await this.failure(
 							`${job.kind}: inaccessible Discord resource (${error.status})`,
 						);
@@ -441,13 +492,37 @@ export class GatewayDO {
 				}
 			}
 			// Interaction replay records expire after Discord tokens are no longer usable.
-			const seen = await this.state.storage.list<{
-				time: number;
-				payload: string;
-			}>({ prefix: "seen:", limit: 128 });
-			for (const [key, time] of seen)
-				if (time.time < Date.now() - 86400000)
-					await this.state.storage.delete(key);
+			const cleanupCursor = await this.state.storage.get<string>(
+				"command-cleanup-cursor",
+			);
+			const seen = await this.state.storage.list<CommandRecord>({
+				prefix: "seen:",
+				limit: 128,
+				startAfter: cleanupCursor,
+			});
+			await this.state.storage.transaction(async (tx) => {
+				let removed = 0;
+				for (const [key, record] of seen) {
+					if (
+						record.time < Date.now() - 86400000 &&
+						!(await tx.get(`job:${key.slice(5)}`))
+					) {
+						await tx.delete(key);
+						removed++;
+					}
+				}
+				if (removed)
+					await tx.put(
+						"command-record-count",
+						Math.max(
+							0,
+							((await tx.get<number>("command-record-count")) ?? 0) - removed,
+						),
+					);
+				const last = [...seen.keys()].at(-1);
+				if (last) await tx.put("command-cleanup-cursor", last);
+				else await tx.delete("command-cleanup-cursor");
+			});
 			const pending = await this.state.storage.list<Job>({
 				prefix: "job:",
 				limit: MAX_QUEUE,
@@ -469,6 +544,7 @@ export class GatewayDO {
 				await this.schedule(Math.max(1000, due - Date.now()));
 			} else if (await this.state.storage.get("enabled"))
 				await this.schedule(60000);
+			else if (seen.size || cleanupCursor) await this.schedule(3600000);
 		});
 	}
 	private async connect() {
@@ -739,6 +815,7 @@ export class GatewayDO {
 		}
 		if (job.kind === "reply") {
 			if (job.data.expiresAt < Date.now()) {
+				job.data.delivery = "expired";
 				await this.failure(
 					"Reply token expired after durable command execution",
 				);

@@ -8,6 +8,51 @@ export { GatewayDO } from "./gateway";
 
 const MAX_BODY = 64 * 1024;
 const MAX_AGE_SECONDS = 300;
+async function captureResult(
+	response: Response,
+	deadline: number,
+): Promise<{
+	state: "pending" | "completed";
+	payload?: Record<string, unknown>;
+}> {
+	const reader = response.body?.getReader();
+	if (!reader) throw new Error("Missing capture response");
+	const chunks: Uint8Array[] = [];
+	let length = 0;
+	try {
+		while (true) {
+			const { value, done } = await withinDeadline(
+				reader.read(),
+				Math.max(1, deadline - Date.now()),
+			);
+			if (done) break;
+			length += value.length;
+			if (length > MAX_BODY) throw new Error("Capture response exceeds limit");
+			chunks.push(value);
+		}
+	} finally {
+		void reader.cancel().catch(() => {});
+	}
+	const bytes = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.length;
+	}
+	const result = JSON.parse(
+		new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+	);
+	if (result?.state !== "pending" && result?.state !== "completed")
+		throw new Error("Invalid capture response");
+	if (
+		result.state === "completed" &&
+		(!result.payload ||
+			typeof result.payload !== "object" ||
+			Array.isArray(result.payload))
+	)
+		throw new Error("Missing completed result");
+	return result;
+}
 async function withinDeadline<T>(
 	promise: Promise<T>,
 	timeoutMs: number,
@@ -150,9 +195,28 @@ export default {
 				}),
 				Math.max(1, deadline - Date.now()),
 			);
-			await queued.body?.cancel();
-			if (!queued.ok)
-				return new Response("Command queue unavailable", { status: 503 });
+			if (!queued.ok) {
+				await queued.body?.cancel();
+				const status = [409, 410].includes(queued.status) ? queued.status : 503;
+				return new Response(
+					status === 409
+						? "Interaction conflicts with captured command"
+						: status === 410
+							? "Interaction expired"
+							: "Command queue unavailable",
+					{ status },
+				);
+			}
+			const captured = await captureResult(queued, deadline);
+			if (captured.state === "completed")
+				return Response.json({
+					type: 4,
+					data: {
+						...captured.payload,
+						flags: 64,
+						allowed_mentions: { parse: [] },
+					},
+				});
 			return Response.json({ type: 5, data: { flags: 64 } });
 		} catch {
 			if (interaction.type === 4)

@@ -205,8 +205,8 @@ describe("constant set-based matching", () => {
 		const store = new Database(budget.wrap(trace.db));
 		const result = await store.executeMarket(m.id, "80-match");
 		expect(result.executions).toHaveLength(40);
-		expect(budget.used).toBe(20);
-		expect(trace.total).toBe(20);
+		expect(budget.used).toBe(21);
+		expect(trace.total).toBe(21);
 		expect(trace.transportCalls).toBe(6);
 		expect(trace.maxParameters).toBeLessThanOrEqual(100);
 		expect((await new Database(env.DB).getMarket(m.id))?.collateralUnits).toBe(
@@ -219,7 +219,7 @@ describe("constant set-based matching", () => {
 		).toEqual({ balance: 7600000, locked: 0 });
 		expect(await new Database(env.DB).getMarketOrders(m.id)).toEqual([]);
 		expect(await store.executeMarket(m.id, "80-match")).toEqual(result);
-		expect(budget.used).toBe(21);
+		expect(budget.used).toBe(22);
 	});
 	it("actual order command creates the 80th order and applies all fills under 50 statements", async () => {
 		const m = await matchingFixture(79);
@@ -253,8 +253,8 @@ describe("constant set-based matching", () => {
 			(await executeInteraction(i, { ...env, DB: budget.wrap(trace.db) }))
 				.content,
 		).toContain("Order");
-		expect(budget.used).toBe(37);
-		expect(trace.total).toBe(37);
+		expect(budget.used).toBe(38);
+		expect(trace.total).toBe(38);
 		expect(await new Database(env.DB).getMarketOrders(m.id)).toEqual([]);
 	});
 	it("order command yields unaffordable match retry and resumes with the committed order receipt", async () => {
@@ -292,14 +292,14 @@ describe("constant set-based matching", () => {
 		await expect(
 			executeInteraction(i, { ...env, DB: budget.wrap(trace.db) }),
 		).rejects.toBeInstanceOf(D1QueryBudgetExceeded);
-		expect(budget.used).toBe(43);
-		expect(trace.total).toBe(43);
+		expect(budget.used).toBe(44);
+		expect(trace.total).toBe(44);
 		expect(await new Database(env.DB).getMarketOrders(m.id)).toHaveLength(80);
 		const next = new D1QueryBudget();
 		expect(
 			(await executeInteraction(i, { ...env, DB: next.wrap(env.DB) })).content,
 		).toContain("Order");
-		expect(next.used).toBe(22);
+		expect(next.used).toBe(23);
 		expect(await new Database(env.DB).getMarketOrders(m.id)).toEqual([]);
 	});
 
@@ -318,7 +318,7 @@ describe("constant set-based matching", () => {
 			"lost-match",
 		);
 		expect(result.executions).toHaveLength(40);
-		expect(budget.used).toBe(22);
+		expect(budget.used).toBe(23);
 		expect(
 			(
 				await env.DB.prepare(
@@ -345,7 +345,7 @@ describe("constant set-based matching", () => {
 		]);
 		const budget = new D1QueryBudget();
 		await new Database(budget.wrap(env.DB)).executeMarket(m.id, "partial");
-		expect(budget.used).toBe(22);
+		expect(budget.used).toBe(23);
 		const order = await new Database(env.DB).getOrder(users[0], m.id);
 		expect(order?.quantityUnits).toBe(10000);
 		expect(order?.escrowUnits).toBe(6000);

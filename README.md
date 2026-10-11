@@ -57,7 +57,10 @@ that same batch. Stale revisions are retried. Reusing an operation ID with diffe
 arguments fails. Every writer must use this ledger; direct administrative writes
 would bypass its snapshot protocol. Markets are bounded to 80 participants and
 2–10 outcomes to keep matching and settlement batches finite. The participant cap
-rejects new participants; existing holders can still sell or reorder at the cap.
+counts users with outstanding orders or positive holdings; existing active users
+can still sell or reorder at the cap. Selling out releases the participant slot.
+Empty positions are removed atomically during matching and excluded from admission,
+settlement projections and position views.
 Short sells mint
 funded complete baskets; collateral equals every outcome's share supply and is
 paid exactly once at resolution. Cancel/fill/settle release their associated escrow.
@@ -72,6 +75,16 @@ D1 operation receipts cover a crash after a remote effect but before local compl
 A deadline response or network failure can have an ambiguous outcome: pending
 admission may still commit after an HTTP 503. Replaying the same interaction ID is
 safe; creating a new interaction is a new operation.
+Pending interaction replays defer only while durable work exists. Executed commands
+retain their response atomically with the outbox transition; matching replays return
+that cached ephemeral response without rerunning commands, including after delivery,
+terminal webhook errors or object eviction. Completed response records become eligible
+for cleanup after 24 hours; bounded pages advance past protected pending records.
+At most 4,096 command records are admitted; saturation rejects fresh requests with
+503 while existing replays remain available. Pending records survive cleanup. Old IDs
+without a retained record are rejected rather than recreated. These HTTP replay
+states are tested with fake Discord endpoints; live Discord retry/duplicate-response
+acceptance has not been verified.
 A Durable Object transaction does **not** cover D1 calls. Captured reactions retain
 order across retries. The queue has finite capacity; saturation disconnects without
 advancing the checkpoint so Discord resume can replay. Reconnect, session invalidation,
@@ -112,7 +125,7 @@ durable work resumes in a fresh alarm. Reaction-page cursors retain partial prog
 Matching and settlement use set-based SQL so their cost does not grow with the
 80-participant bound; collection reads avoid per-record queries.
 At that bound, tested command paths use 17 statements for settlement including
-authorization reads, and 37 for order creation plus matching. Contention can yield
+authorization reads, and 38 for order creation plus matching. Contention can yield
 between those receipt-backed operations; it does not split an atomic ledger batch.
 [D1 limits](https://developers.cloudflare.com/d1/platform/limits/) list 50 queries
 on Free, while the [workerd binding](https://github.com/cloudflare/workerd/blob/main/src/cloudflare/internal/d1-api.ts)

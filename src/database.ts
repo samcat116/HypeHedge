@@ -527,7 +527,7 @@ export class Database {
 		guild?: string,
 	): Promise<UserPositionView[]> {
 		const rows = await this.rows(
-			`SELECT m.id AS market_id,COALESCE(p.holdings,'{}') AS holdings,m.number AS market_number,m.description AS market_description,m.status AS market_status,CASE WHEN o.id IS NULL THEN NULL ELSE json_object('id',o.id,'userId',o.user_id,'marketId',o.market_id,'outcomeId',o.outcome_id,'direction',o.direction,'quantityUnits',o.quantity_units,'priceUnits',o.price_units,'escrowUnits',o.escrow_units,'createdAt',o.created_at) END AS order_json FROM markets m LEFT JOIN positions p ON p.market_id=m.id AND p.user_id=? LEFT JOIN orders o ON o.market_id=m.id AND o.user_id=? WHERE (p.id IS NOT NULL OR o.id IS NOT NULL) ${guild ? "AND m.guild_id=?" : ""} ORDER BY m.number DESC`,
+			`SELECT m.id AS market_id,COALESCE(p.holdings,'{}') AS holdings,m.number AS market_number,m.description AS market_description,m.status AS market_status,CASE WHEN o.id IS NULL THEN NULL ELSE json_object('id',o.id,'userId',o.user_id,'marketId',o.market_id,'outcomeId',o.outcome_id,'direction',o.direction,'quantityUnits',o.quantity_units,'priceUnits',o.price_units,'escrowUnits',o.escrow_units,'createdAt',o.created_at) END AS order_json FROM markets m LEFT JOIN positions p ON p.market_id=m.id AND p.user_id=? LEFT JOIN orders o ON o.market_id=m.id AND o.user_id=? WHERE (EXISTS(SELECT 1 FROM json_each(p.holdings) WHERE value>0) OR o.id IS NOT NULL) ${guild ? "AND m.guild_id=?" : ""} ORDER BY m.number DESC`,
 			user,
 			user,
 			...(guild ? [guild] : []),
@@ -586,13 +586,16 @@ export class Database {
 					};
 				const participantCount = (
 					await this.one(
-						"SELECT count(DISTINCT user_id) AS count FROM (SELECT user_id FROM orders WHERE market_id=? UNION SELECT user_id FROM positions WHERE market_id=?)",
+						"SELECT count(DISTINCT user_id) AS count FROM (SELECT user_id FROM orders WHERE market_id=? UNION SELECT user_id FROM positions WHERE market_id=? AND EXISTS(SELECT 1 FROM json_each(positions.holdings) WHERE value>0))",
 						marketId,
 						marketId,
 					)
 				).count;
 				const position = await this.getPosition(userId, marketId);
-				if (participantCount >= MAX_MARKET_PARTICIPANTS && !position)
+				if (
+					participantCount >= MAX_MARKET_PARTICIPANTS &&
+					!Object.values(position?.holdings ?? {}).some((units) => units > 0)
+				)
 					return { success: false, error: "Market participant limit reached" };
 				const holdings = position?.holdings ?? {};
 				const escrowUnits = calculateEscrow(
@@ -690,7 +693,7 @@ export class Database {
 					return { executions: [], error: "Market not open" };
 				const orders = await this.getMarketOrders(marketId);
 				const positions = await this.rows(
-					"SELECT * FROM positions WHERE market_id=?",
+					"SELECT * FROM positions WHERE market_id=? AND EXISTS(SELECT 1 FROM json_each(positions.holdings) WHERE value>0)",
 					marketId,
 				);
 				const match = executeMatching(
@@ -763,6 +766,14 @@ export class Database {
 						this.assertion("changes()=?", changed.size),
 					);
 				}
+				// A trader who sells every share no longer occupies a participant slot.
+				// Prune historical {} and zero-only JSON rows in the same guarded batch.
+				s.push(
+					this.sql(
+						"DELETE FROM positions WHERE market_id=? AND NOT EXISTS(SELECT 1 FROM json_each(positions.holdings) WHERE value>0)",
+						marketId,
+					),
+				);
 				const removed = match.orderUpdates.filter(
 					(u) => u.newQuantityUnits === 0,
 				);
@@ -835,7 +846,7 @@ export class Database {
 					return null;
 				const orders = await this.getMarketOrders(marketId);
 				const positions = await this.rows(
-					"SELECT * FROM positions WHERE market_id=?",
+					"SELECT * FROM positions WHERE market_id=? AND EXISTS(SELECT 1 FROM json_each(positions.holdings) WHERE value>0)",
 					marketId,
 				);
 				const payouts: PayoutInfo[] = [];

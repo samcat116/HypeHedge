@@ -10,6 +10,7 @@ import { Database } from "../../src/database";
 // biome-ignore lint/suspicious/noExplicitAny: White-box failure injection intentionally inspects private runtime fields and persisted JSON.
 type TestValue = any;
 
+const commandId = ((BigInt(Date.now() - 1420070400000) << 22n) + 7n).toString();
 const runtimeFetch = globalThis.fetch.bind(globalThis);
 
 beforeEach(() => {
@@ -204,7 +205,7 @@ describe("durable Gateway capture", () => {
 	it("persists interaction before acknowledging and replays do not duplicate work", async () => {
 		const stub = gateway();
 		const body = JSON.stringify({
-			id: "123456789",
+			id: commandId,
 			token: "fake",
 			application_id: "123",
 		});
@@ -228,7 +229,7 @@ describe("durable Gateway capture", () => {
 		const response = await stub.fetch("https://gateway/commands", {
 			method: "POST",
 			body: JSON.stringify({
-				id: "123456789",
+				id: commandId,
 				token: "fake",
 				application_id: "123",
 			}),
@@ -242,16 +243,22 @@ describe("durable Gateway capture", () => {
 		const stub = gateway();
 		await stub.fetch("https://gateway/commands", {
 			method: "POST",
-			body: JSON.stringify({ id: "123456789", token: "fake" }),
+			body: JSON.stringify({
+				id: commandId,
+				token: "fake",
+			}),
 		});
 		expect(
 			(
 				await stub.fetch("https://gateway/commands", {
 					method: "POST",
-					body: JSON.stringify({ id: "123456789", token: "changed" }),
+					body: JSON.stringify({
+						id: commandId,
+						token: "changed",
+					}),
 				})
 			).status,
-		).toBe(503);
+		).toBe(409);
 	});
 	it("retains failed REST work and blocks later event effects", async () => {
 		const stub = gateway();

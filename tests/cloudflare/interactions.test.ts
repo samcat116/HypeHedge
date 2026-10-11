@@ -119,7 +119,7 @@ describe("signed interactions in workerd", () => {
 					fetch: async (_url: unknown, init: RequestInit) => {
 						expect(JSON.parse(String(init.body)).id).toBe("12345");
 						captured = true;
-						return new Response("ok");
+						return Response.json({ state: "pending" });
 					},
 				}),
 			},
