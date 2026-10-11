@@ -398,7 +398,7 @@ async function runInteraction(
 				env.GATEWAY.idFromName("discord"),
 			).fetch("https://gateway/backfill", {
 				method: "POST",
-				body: JSON.stringify(data),
+				body: JSON.stringify({ ...data, interactionId: i.id }),
 			});
 			await result.body?.cancel();
 			if (!result.ok) throw new Error("Backfill queue unavailable");
@@ -573,9 +573,25 @@ async function runInteraction(
 	}
 	if (command === "market" && sub === "view") {
 		const orders = await db.getMarketOrders(market.id);
+		const outcomesById = new Map(
+			market.outcomes.map((outcome) => [outcome.id, outcome]),
+		);
+		const outcomeLabel = (outcome: { description: string; number: number }) => {
+			if (outcome.description.length <= 80) return outcome.description;
+			const prefix = `#${outcome.number} `;
+			return `${prefix}${outcome.description.slice(0, 80 - prefix.length - 3)}...`;
+		};
+		const orderBook =
+			orders
+				.map((order) => {
+					const outcome = outcomesById.get(order.outcomeId);
+					const label = outcome ? outcomeLabel(outcome) : "Unknown outcome";
+					return `${label}: ${order.direction} ${formatShareUnits(order.quantityUnits)} @ ${formatPriceUnits(order.priceUnits)}`;
+				})
+				.join("\n") || "No active orders.";
 		return {
 			...message(
-				`#${market.number} ${market.description}\n${market.status} | Oracle <@${market.oracleUserId}>\n${market.outcomes.map((o) => o.description).join(", ")}\n${orders.map((o) => `${o.direction} ${formatShareUnits(o.quantityUnits)} @ ${formatPriceUnits(o.priceUnits)}`).join("\n")}`,
+				`#${market.number} ${market.description}\n${market.status} | Oracle <@${market.oracleUserId}>\n${market.outcomes.map((o) => o.description).join(", ")}\n${orderBook}`,
 			),
 			components:
 				market.status === "open"
@@ -584,7 +600,7 @@ async function runInteraction(
 							(rs.at(-1) as { components: unknown[] }).components.push(
 								button(
 									`market:quickorder:${market.id}:${o.id}`,
-									o.description.slice(0, 80),
+									outcomeLabel(o),
 								),
 							);
 							return rs;

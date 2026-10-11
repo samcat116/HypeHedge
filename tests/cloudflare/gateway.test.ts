@@ -552,7 +552,7 @@ describe("durable Gateway capture", () => {
 			"fetch",
 			vi.fn(async () => Response.json([{ id: "987652", bot: false }])),
 		);
-		await inside(stub, async (instance) => {
+		await inside(stub, async (instance, state) => {
 			const db = new Database(env.DB);
 			const data = {
 				scanId: "first",
@@ -575,14 +575,17 @@ describe("durable Gateway capture", () => {
 				attempts: 0,
 				due: 0,
 			};
+			await state.storage.put(`job:${job.id}`, job);
 			await instance.backfill(job, db);
 			expect((await db.getBalance("987654")).balanceUnits).toBe(10000);
 			data.reactionIndex = 0;
+			await state.storage.put(`job:${job.id}`, job);
 			await instance.backfill(job, db);
 			expect((await db.getBalance("987654")).balanceUnits).toBe(10000);
 			await db.removeReaction("987653", "987652", "👍", "live-remove");
 			data.scanId = "second";
 			data.reactionIndex = 0;
+			await state.storage.put(`job:${job.id}`, job);
 			await instance.backfill(job, db);
 			expect((await db.getBalance("987654")).balanceUnits).toBe(10000);
 		});

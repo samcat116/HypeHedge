@@ -401,3 +401,199 @@ it("expected input errors become durable reply jobs while transient database fai
 		executeInteraction(bad, { ...testEnv(), DB: failingDB }),
 	).rejects.toThrow("D1 unavailable");
 });
+
+it.each([
+	["binary", ["Yes", "No"]],
+	["multiple choice", ["Team A", "Team B", "Team C"]],
+] as const)(
+	"market view identifies outcomes in otherwise identical %s buy and sell orders",
+	async (kind, descriptions) => {
+		const { Database } = await import("../../src/database");
+		const db = new Database(env.DB);
+		const market = await db.createMarket({
+			guildId: "123",
+			creatorId: "456",
+			oracleUserId: "456",
+			description: `${kind} order book`,
+			outcomeDescriptions: [...descriptions],
+		});
+		const view = () =>
+			executeInteraction(
+				interaction({
+					data: {
+						name: "market",
+						options: [
+							{
+								name: "view",
+								type: 1,
+								options: [{ name: "market", type: 3, value: market.id }],
+							},
+						],
+					},
+				}),
+				testEnv(),
+			);
+		const empty = await view();
+		expect(empty.content).toContain("No active orders.");
+		const controls = (
+			empty.components as {
+				components: { custom_id: string; label: string }[];
+			}[]
+		).flatMap((row) => row.components);
+		expect(controls.map((control) => control.custom_id)).toEqual(
+			market.outcomes.map(
+				(outcome) => `market:quickorder:${market.id}:${outcome.id}`,
+			),
+		);
+		expect(controls.map((control) => control.label)).toEqual([...descriptions]);
+		for (const outcome of market.outcomes) {
+			for (const direction of ["buy", "sell"] as const) {
+				const user = `${kind}-${outcome.id}-${direction}`;
+				for (let credit = 0; credit < 3; credit++)
+					await db.addReaction(`${user}-${credit}`, "reactor", user, "x");
+				expect(
+					(
+						await db.createOrder(
+							user,
+							market.id,
+							outcome.id,
+							direction,
+							2,
+							5000,
+						)
+					).success,
+				).toBe(true);
+			}
+		}
+		const populated = await view();
+		for (const description of descriptions) {
+			expect(populated.content?.split("\n")).toContain(
+				`${description}: buy 2 @ 50%`,
+			);
+			expect(populated.content?.split("\n")).toContain(
+				`${description}: sell 2 @ 50%`,
+			);
+		}
+		expect(populated.components).toEqual(empty.components);
+		expect(
+			(
+				await executeInteraction(
+					interaction({
+						guild_id: "999",
+						data: {
+							name: "market",
+							options: [
+								{
+									name: "view",
+									type: 1,
+									options: [{ name: "market", type: 3, value: market.id }],
+								},
+							],
+						},
+					}),
+					testEnv(),
+				)
+			).content,
+		).toBe("Market not found in this server.");
+	},
+);
+
+it("market view bounds long outcome labels without removing order details", async () => {
+	const { Database } = await import("../../src/database");
+	const db = new Database(env.DB);
+	const description = "A".repeat(100);
+	const market = await db.createMarket({
+		guildId: "123",
+		creatorId: "456",
+		oracleUserId: "456",
+		description: "Long labels",
+		outcomeDescriptions: [description, "Other"],
+	});
+	await db.addReaction("long-label-credit", "reactor", "long-label-buyer", "x");
+	expect(
+		(
+			await db.createOrder(
+				"long-label-buyer",
+				market.id,
+				market.outcomes[0].id,
+				"buy",
+				1,
+				2500,
+			)
+		).success,
+	).toBe(true);
+	const result = await executeInteraction(
+		interaction({
+			data: {
+				name: "market",
+				options: [
+					{
+						name: "view",
+						type: 1,
+						options: [{ name: "market", type: 3, value: market.id }],
+					},
+				],
+			},
+		}),
+		testEnv(),
+	);
+	expect(result.content?.split("\n")).toContain(
+		`#1 ${"A".repeat(74)}...: buy 1 @ 25%`,
+	);
+});
+
+it("market view distinguishes long outcome labels with a shared prefix", async () => {
+	const { Database } = await import("../../src/database");
+	const db = new Database(env.DB);
+	const prefix = "Shared prefix ".repeat(6);
+	const market = await db.createMarket({
+		guildId: "123",
+		creatorId: "456",
+		oracleUserId: "456",
+		description: "Shared prefixes",
+		outcomeDescriptions: [`${prefix}first`, `${prefix}second`],
+	});
+	for (const outcome of market.outcomes) {
+		const user = `shared-prefix-${outcome.number}`;
+		await db.addReaction(user, "reactor", user, "x");
+		expect(
+			(await db.createOrder(user, market.id, outcome.id, "buy", 1, 2500))
+				.success,
+		).toBe(true);
+	}
+	const result = await executeInteraction(
+		interaction({
+			data: {
+				name: "market",
+				options: [
+					{
+						name: "view",
+						type: 1,
+						options: [{ name: "market", type: 3, value: market.id }],
+					},
+				],
+			},
+		}),
+		testEnv(),
+	);
+	const labels = [
+		`#1 ${prefix.slice(0, 74)}...`,
+		`#2 ${prefix.slice(0, 74)}...`,
+	];
+	for (const label of labels) {
+		expect(label).toHaveLength(80);
+		expect(result.content?.split("\n")).toContain(`${label}: buy 1 @ 25%`);
+	}
+	expect(labels[0]).not.toBe(labels[1]);
+	const controls = (
+		result.components as {
+			components: { custom_id: string; label: string }[];
+		}[]
+	).flatMap((row) => row.components);
+	expect(controls.map((control) => control.label)).toEqual(labels);
+	expect(controls.map((control) => control.custom_id)).toEqual(
+		market.outcomes.map(
+			(outcome) => `market:quickorder:${market.id}:${outcome.id}`,
+		),
+	);
+});

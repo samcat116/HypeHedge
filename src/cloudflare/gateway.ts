@@ -1,5 +1,5 @@
 import { Database } from "../database";
-import { executeInteraction } from "./interactions";
+import { type MessagePayload, executeInteraction } from "./interactions";
 
 // biome-ignore lint/suspicious/noExplicitAny: Discord Gateway wire JSON is validated per event at the boundary.
 type DiscordData = any;
@@ -44,6 +44,13 @@ interface Backfill {
 	userAfter?: string;
 	userPages?: number;
 }
+interface BackfillAdmission {
+	guildId: string;
+	limit?: number;
+	reset?: boolean;
+	interactionId?: string;
+}
+type BackfillAdmissionResult = "accepted" | "conflict" | "full";
 const MAX_QUEUE = 512;
 const INTENTS = 1 | 512 | 1024; // GUILDS, GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS
 
@@ -142,32 +149,111 @@ export class GatewayDO {
 				const data = (await request.json()) as DiscordData;
 				if (!/^\d{1,20}$/.test(data.guildId ?? ""))
 					return new Response("Invalid guild", { status: 400 });
-				const job: Backfill = {
-					scanId: crypto.randomUUID(),
-					guildId: data.guildId,
-					channelIndex: 0,
-					limit: Math.min(1000, Math.max(1, Number(data.limit) || 100)),
-					scanned: 0,
-				};
-				const id = `backfill:${data.guildId}`;
-				if (await this.state.storage.get(`job:${id}`))
-					return new Response("Already running");
 				if (
-					!(await this.enqueue({
-						kind: "backfill",
-						data: job,
-						id,
-						attempts: 0,
-						due: Date.now(),
-					}))
+					data.interactionId !== undefined &&
+					!/^\d{1,20}$/.test(data.interactionId)
 				)
-					return new Response("Queue full", { status: 503 });
+					return new Response("Invalid interaction ID", { status: 400 });
+				const result = await this.admitBackfill(data);
+				if (result !== "accepted")
+					return new Response(
+						result === "conflict"
+							? "Backfill admission conflicts with recorded interaction"
+							: "Queue full",
+						{ status: result === "conflict" ? 409 : 503 },
+					);
 				await this.schedule();
 				return new Response("Backfill queued");
 			}
 			return new Response("Not found", { status: 404 });
 		})();
 	}
+	/** Admission is short and independent from Discord REST calls in the effect lane. */
+	private async admitBackfill(
+		input: BackfillAdmission,
+	): Promise<BackfillAdmissionResult> {
+		const data = {
+			guildId: input.guildId,
+			limit: Math.min(1000, Math.max(1, Number(input.limit) || 100)),
+			reset: input.reset === true,
+		};
+		const scanId = input.interactionId ?? crypto.randomUUID();
+		const payload = JSON.stringify(data);
+		return this.state.storage.transaction(async (tx) => {
+			const receiptKey = `backfill-admission:${scanId}`;
+			const previous = await tx.get<{ payload: string }>(receiptKey);
+			if (previous)
+				return previous.payload === payload ? "accepted" : "conflict";
+			const key = `job:backfill:${data.guildId}`;
+			const existing = await tx.get<Job>(key);
+			const latest = await tx.get<string>(`backfill-latest:${data.guildId}`);
+			// Interaction IDs are ordered snowflakes. Delayed old admissions cannot rewind a newer reset.
+			const older =
+				input.interactionId &&
+				latest &&
+				BigInt(input.interactionId) < BigInt(latest);
+			if (!older && (!existing || data.reset)) {
+				if (
+					!existing &&
+					(await tx.list({ prefix: "job:", limit: MAX_QUEUE })).size >=
+						MAX_QUEUE
+				)
+					return "full";
+				await tx.put(key, {
+					kind: "backfill",
+					id: `backfill:${data.guildId}`,
+					data: {
+						scanId,
+						guildId: data.guildId,
+						channelIndex: 0,
+						limit: data.limit,
+						scanned: 0,
+					},
+					attempts: 0,
+					due: Date.now(),
+				} satisfies Job);
+			}
+			await tx.put(receiptKey, {
+				payload,
+				scanId: older
+					? undefined
+					: existing && !data.reset
+						? existing.data.scanId
+						: scanId,
+			});
+			if (
+				input.interactionId &&
+				(!latest || BigInt(input.interactionId) > BigInt(latest))
+			)
+				await tx.put(`backfill-latest:${data.guildId}`, input.interactionId);
+			return "accepted";
+		});
+	}
+	private async currentGeneration(job: Job): Promise<boolean> {
+		if (job.kind !== "backfill") return true;
+		const current = await this.state.storage.get<Job>(`job:${job.id}`);
+		return (
+			current?.kind === "backfill" && current.data.scanId === job.data.scanId
+		);
+	}
+	/** Every backfill completion/retry save is fenced against concurrently admitted resets. */
+	private async saveJob(
+		key: string,
+		job: Job,
+		complete: boolean,
+		generation?: string,
+	): Promise<void> {
+		await this.state.storage.transaction(async (tx) => {
+			if (generation !== undefined) {
+				const current = await tx.get<Job>(key);
+				if (current?.kind !== "backfill" || current.data.scanId !== generation)
+					return;
+			}
+			if (complete) await tx.delete(key);
+			else await tx.put(key, job);
+		});
+	}
+
 	private async enqueue(job: Job, remember = false): Promise<boolean> {
 		return this.state.storage.transaction(async (tx) => {
 			if (remember) {
@@ -224,15 +310,17 @@ export class GatewayDO {
 					if (job.kind === "event") blockedEvents = true;
 					continue;
 				}
+				if (!(await this.currentGeneration(job))) continue;
+				const generation =
+					job.kind === "backfill" ? (job.data.scanId as string) : undefined;
 				processed++;
 				try {
 					const complete = await this.process(job);
-					if (complete) await this.state.storage.delete(key);
-					else await this.state.storage.put(key, job);
+					await this.saveJob(key, job, complete, generation);
 				} catch (error) {
 					if (error instanceof BackfillLimit) {
 						await this.failure(error.message);
-						await this.state.storage.delete(key);
+						await this.saveJob(key, job, true, generation);
 						continue;
 					}
 					job.attempts++;
@@ -250,10 +338,10 @@ export class GatewayDO {
 						await this.failure(
 							`${job.kind}: inaccessible Discord resource (${error.status})`,
 						);
-						await this.state.storage.delete(key);
+						await this.saveJob(key, job, true, generation);
 						continue;
 					}
-					await this.state.storage.put(key, job);
+					await this.saveJob(key, job, false, generation);
 					if (job.kind === "event") blockedEvents = true;
 				}
 			}
@@ -525,27 +613,21 @@ export class GatewayDO {
 			return true;
 		}
 		if (job.kind === "command") {
-			const data = await executeInteraction(
-				job.data,
-				this.env,
-				async (data) => {
-					const id = `backfill:${data.guildId}`;
-					if (await this.state.storage.get(`job:${id}`)) return true;
-					return this.enqueue({
-						kind: "backfill",
-						data: {
-							guildId: data.guildId,
-							scanId: job.data.id,
-							channelIndex: 0,
-							limit: Math.min(1000, Math.max(1, data.limit)),
-							scanned: 0,
-						},
-						id,
-						attempts: 0,
-						due: Date.now(),
+			let data: MessagePayload;
+			try {
+				data = await executeInteraction(job.data, this.env, async (input) => {
+					const result = await this.admitBackfill({
+						...input,
+						interactionId: job.data.id,
 					});
-				},
-			);
+					if (result !== "accepted")
+						throw new BackfillAdmissionUnavailable(result);
+					return true;
+				});
+			} catch (error) {
+				if (!(error instanceof BackfillAdmissionUnavailable)) throw error;
+				data = { content: error.message, allowed_mentions: { parse: [] } };
+			}
 			// Same job becomes its outbox atomically; crash before this write reruns the receipt-backed command.
 			job.kind = "reply";
 			job.data = {
@@ -572,85 +654,131 @@ export class GatewayDO {
 		}
 		return this.backfill(job, db);
 	}
+	private advanceChannel(data: Backfill) {
+		data.channelIndex++;
+		data.scanned = 0;
+		data.before = undefined;
+		data.message = undefined;
+		data.reactionIndex = undefined;
+		data.userAfter = undefined;
+		data.userPages = undefined;
+	}
+	private finishMessage(data: Backfill) {
+		data.scanned++;
+		data.before = data.message?.id;
+		data.message = undefined;
+		data.reactionIndex = undefined;
+		data.userAfter = undefined;
+		data.userPages = undefined;
+		if (data.scanned >= data.limit) this.advanceChannel(data);
+	}
+
 	private async backfill(job: Job, db: Database): Promise<boolean> {
 		const data = job.data as Backfill;
-		if (!data.channelIds) {
-			const channels = (
-				await this.api(`/guilds/${data.guildId}/channels`)
-			).filter((c: DiscordData) => c.type === 0 || c.type === 5);
-			if (channels.length > 500)
-				throw new BackfillLimit(
-					"Backfill refused: guild exceeds 500-channel limit",
-				);
-			data.channelIds = channels.map((c: DiscordData) => c.id);
-		}
-		const channel = data.channelIds?.[data.channelIndex];
-		if (!channel) return true;
-		if (!data.message) {
-			const messages = await this.api(
-				`/channels/${channel}/messages?limit=1${data.before ? `&before=${data.before}` : ""}`,
-			);
-			if (!messages.length) {
-				data.channelIndex++;
-				data.scanned = 0;
-				data.before = undefined;
-				return !data.channelIds?.[data.channelIndex];
-			}
-			data.message = messages[0];
-			data.reactionIndex = 0;
-			data.userPages = 0;
-		}
-		const message = data.message;
-		const reaction = message.author.bot
-			? undefined
-			: message.reactions?.[data.reactionIndex ?? 0];
-		if (reaction) {
-			if ((data.userPages ?? 0) >= 100)
-				throw new BackfillLimit(
-					"Backfill partial: reaction exceeds 10000-user limit",
-				);
-			const emoji = reaction.emoji.id ?? reaction.emoji.name;
-			const pathEmoji = reaction.emoji.id
-				? `${reaction.emoji.name}:${reaction.emoji.id}`
-				: emoji;
-			const users = await this.api(
-				`/channels/${channel}/messages/${message.id}/reactions/${encodeURIComponent(pathEmoji)}?limit=100${data.userAfter ? `&after=${data.userAfter}` : ""}`,
-			);
-			for (const user of users)
-				if (!user.bot && user.id !== message.author.id)
-					await db.addReaction(
-						message.id,
-						user.id,
-						message.author.id,
-						emoji,
-						`backfill:${data.scanId}:${message.id}:${user.id}:${emoji}`,
+		let stage = "guild channel enumeration";
+		try {
+			if (!data.channelIds) {
+				stage = "guild channel enumeration";
+				const channels = (
+					await this.api(`/guilds/${data.guildId}/channels`)
+				).filter((c: DiscordData) => c.type === 0 || c.type === 5);
+				if (channels.length > 500)
+					throw new BackfillLimit(
+						"Backfill refused: guild exceeds 500-channel limit",
 					);
-			data.userPages = (data.userPages ?? 0) + 1;
-			if (users.length === 100) {
-				data.userAfter = users.at(-1).id;
-				// Refuse unbounded scans rather than silently marking partial awards complete.
-				if (data.userPages >= 100)
+				if (!(await this.currentGeneration(job))) return true;
+				data.channelIds = channels.map((c: DiscordData) => c.id);
+			}
+			const channel = data.channelIds?.[data.channelIndex];
+			if (!channel) return true;
+			if (!data.message) {
+				stage = "channel message listing";
+				const messages = await this.api(
+					`/channels/${channel}/messages?limit=1${data.before ? `&before=${data.before}` : ""}`,
+				);
+				if (!(await this.currentGeneration(job))) return true;
+				if (!messages.length) {
+					data.channelIndex++;
+					data.scanned = 0;
+					data.before = undefined;
+					return !data.channelIds?.[data.channelIndex];
+				}
+				data.message = messages[0];
+				data.reactionIndex = 0;
+				data.userPages = 0;
+			}
+			const message = data.message;
+			const reaction = message.author.bot
+				? undefined
+				: message.reactions?.[data.reactionIndex ?? 0];
+			if (reaction) {
+				if ((data.userPages ?? 0) >= 100)
 					throw new BackfillLimit(
 						"Backfill partial: reaction exceeds 10000-user limit",
 					);
+				const emoji = reaction.emoji.id ?? reaction.emoji.name;
+				const pathEmoji = reaction.emoji.id
+					? `${reaction.emoji.name}:${reaction.emoji.id}`
+					: emoji;
+				stage = "message reaction enumeration";
+				const users = await this.api(
+					`/channels/${channel}/messages/${message.id}/reactions/${encodeURIComponent(pathEmoji)}?limit=100${data.userAfter ? `&after=${data.userAfter}` : ""}`,
+				);
+				if (!(await this.currentGeneration(job))) return true;
+				for (const user of users)
+					if (!user.bot && user.id !== message.author.id) {
+						if (!(await this.currentGeneration(job))) return true;
+						await db.addReaction(
+							message.id,
+							user.id,
+							message.author.id,
+							emoji,
+							`backfill:${data.scanId}:${message.id}:${user.id}:${emoji}`,
+						);
+					}
+				data.userPages = (data.userPages ?? 0) + 1;
+				if (users.length === 100) {
+					data.userAfter = users.at(-1).id;
+					// Refuse unbounded scans rather than silently marking partial awards complete.
+					if (data.userPages >= 100)
+						throw new BackfillLimit(
+							"Backfill partial: reaction exceeds 10000-user limit",
+						);
+				} else {
+					data.reactionIndex = (data.reactionIndex ?? 0) + 1;
+					data.userAfter = undefined;
+					data.userPages = 0;
+				}
 			} else {
-				data.reactionIndex = (data.reactionIndex ?? 0) + 1;
-				data.userAfter = undefined;
-				data.userPages = 0;
+				data.scanned++;
+				data.before = message.id;
+				data.message = undefined;
+				data.reactionIndex = undefined;
+				if (data.scanned >= data.limit) {
+					data.channelIndex++;
+					data.scanned = 0;
+					data.before = undefined;
+				}
 			}
-		} else {
-			data.scanned++;
-			data.before = message.id;
-			data.message = undefined;
-			data.reactionIndex = undefined;
-			if (data.scanned >= data.limit) {
-				data.channelIndex++;
-				data.scanned = 0;
-				data.before = undefined;
-			}
+			job.due = Date.now() + 1000;
+			return !data.channelIds?.[data.channelIndex];
+		} catch (error) {
+			if (
+				!(error instanceof RestError) ||
+				(error.status !== 403 && error.status !== 404)
+			)
+				throw error;
+			if (!(await this.currentGeneration(job))) return true;
+			await this.failure(
+				`Backfill partial: scan ${data.scanId}, guild ${data.guildId}, ${stage}, channel ${data.channelIds?.[data.channelIndex] ?? "none"}, message ${data.message?.id ?? "none"}: Discord ${error.status}`,
+			);
+			if (stage === "guild channel enumeration") return true;
+			if (stage === "channel message listing" || error.status === 403)
+				this.advanceChannel(data);
+			else this.finishMessage(data);
+			job.due = Date.now() + 1000;
+			return !data.channelIds?.[data.channelIndex];
 		}
-		job.due = Date.now() + 1000;
-		return !data.channelIds?.[data.channelIndex];
 	}
 }
 class RateLimited extends Error {
@@ -666,3 +794,13 @@ class RestError extends Error {
 }
 
 class BackfillLimit extends Error {}
+
+class BackfillAdmissionUnavailable extends Error {
+	constructor(result: "conflict" | "full") {
+		super(
+			result === "full"
+				? "Backfill queue is full. Retry after pending commands complete."
+				: "Backfill request conflicts with the recorded interaction; this replay did not change the scan.",
+		);
+	}
+}

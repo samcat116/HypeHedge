@@ -83,6 +83,15 @@ cannot postpone a queued drain.
 Backfill uses persisted bounded cursors: at most 500 channels, 1,000 messages
 per channel, and 10,000 users per reaction. Reaching an oversized scan boundary
 records an observable partial-scan failure; no further page is processed.
+Denied or deleted channels are skipped with partial-scan diagnostics. A deleted
+message advances its channel cursor; an inaccessible guild terminates the scan and
+frees its slot. Rate limits, server errors and network failures retain cursors for
+retry. `/backfill reset:true` starts a fresh scan with the requested limit and
+cleared cursors. Durable interaction receipts prevent a replay or delayed older
+reset from replacing a newer scan, including after object eviction. Reset fences
+local cursor saves and stops subsequent pages and users from the old scan; a D1
+award already in flight may still finish. Existing reaction history remains intact
+and prevents repeated credit across scans.
 
 This is idempotent processing of **captured** events, not an exactly-once guarantee
 for Discord delivery. Discord resume history may expire, messages may be deleted or
