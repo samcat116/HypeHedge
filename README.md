@@ -75,6 +75,13 @@ D1 operation receipts cover a crash after a remote effect but before local compl
 A deadline response or network failure can have an ambiguous outcome: pending
 admission may still commit after an HTTP 503. Replaying the same interaction ID is
 safe; creating a new interaction is a new operation.
+Queued commands must start before the 14-minute reply cutoff. An unstarted expired
+command completes with a retained expiry response and applies no business effects.
+Execution start is recorded durably before business calls; a workflow that already
+started may finish after the cutoff, including recovery after a crash or a partial
+order reservation. This preserves receipt-backed completion without stranding escrow;
+webhook confirmation may then be unavailable. A crash immediately after the start
+record also resumes that authorized workflow.
 Pending interaction replays defer only while durable work exists. Executed commands
 retain their response atomically with the outbox transition; matching replays return
 that cached ephemeral response without rerunning commands, including after delivery,
@@ -89,6 +96,8 @@ A Durable Object transaction does **not** cover D1 calls. Captured reactions ret
 order across retries. The queue has finite capacity; saturation disconnects without
 advancing the checkpoint so Discord resume can replay. Reconnect, session invalidation,
 missed heartbeat acknowledgments, REST retries and rate limits are handled explicitly.
+Route-specific Discord 429 responses delay the affected job; unrelated lanes continue.
+Global rate limits pause the drain until their bounded retry deadline.
 Recovery disconnects preserve Discord resume sessions, while terminal shutdown
 invalidates them. Gateway upgrade requests use HTTPS URLs, as required by workerd.
 Concurrent scheduling retains the earliest alarm deadline, so sustained intake

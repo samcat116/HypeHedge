@@ -31,6 +31,7 @@ interface Job {
 	id: string;
 	attempts: number;
 	due: number;
+	startedAt?: number;
 }
 interface CommandRecord {
 	time: number;
@@ -346,7 +347,11 @@ export class GatewayDO {
 			if (
 				(await this.state.storage.get("enabled")) &&
 				!this.socket &&
-				!this.connecting
+				!this.connecting &&
+				((await this.state.storage.get<number>("restPause")) ?? 0) <=
+					Date.now() &&
+				((await this.state.storage.get<number>("gatewayConnectPause")) ?? 0) <=
+					Date.now()
 			)
 				await this.connect();
 			const jobs = await this.state.storage.list<Job>({
@@ -473,7 +478,8 @@ export class GatewayDO {
 						Date.now() + Math.min(60000, 1000 * 2 ** Math.min(6, job.attempts));
 					if (error instanceof RateLimited) {
 						job.due = Date.now() + error.delay;
-						await this.state.storage.put("restPause", job.due);
+						if (error.global)
+							await this.state.storage.put("restPause", job.due);
 					}
 					if (
 						error instanceof RestError &&
@@ -564,6 +570,7 @@ export class GatewayDO {
 			if (!socket) throw new Error("Gateway did not upgrade");
 			socket.accept();
 			this.socket = socket;
+			await this.state.storage.delete("gatewayConnectPause");
 			socket.addEventListener("message", (event) => {
 				this.state.waitUntil(
 					this.capture(async () => {
@@ -599,8 +606,10 @@ export class GatewayDO {
 			};
 			socket.addEventListener("close", closed);
 			socket.addEventListener("error", closed);
-		} catch {
-			await this.schedule(5000);
+		} catch (error) {
+			const delay = error instanceof RateLimited ? error.delay : 5000;
+			await this.state.storage.put("gatewayConnectPause", Date.now() + delay);
+			await this.schedule(delay);
 		} finally {
 			this.connecting = false;
 		}
@@ -730,6 +739,10 @@ export class GatewayDO {
 		path: string,
 		init: RequestInit = {},
 	): Promise<DiscordData> {
+		const pausedUntil =
+			(await this.state.storage.get<number>("restPause")) ?? 0;
+		if (pausedUntil > Date.now())
+			throw new RateLimited(pausedUntil - Date.now(), true);
 		const response = await fetch(
 			`${this.env.DISCORD_API_BASE ?? "https://discord.com/api/v10"}${path}`,
 			{
@@ -742,17 +755,43 @@ export class GatewayDO {
 			},
 		);
 		if (response.status === 429) {
-			const body = (await response.json()) as DiscordData;
-			throw new RateLimited(
-				Math.max(
-					1000,
-					Math.min(3600000, Number(body.retry_after) * 1000 || 1000),
-				),
-			);
+			const headerGlobal =
+				response.headers.get("X-RateLimit-Global") === "true" ||
+				response.headers.get("X-RateLimit-Scope") === "global";
+			const body = (await response
+				.json()
+				.catch(() => null)) as DiscordData | null;
+			const retrySeconds =
+				[
+					body?.retry_after,
+					response.headers.get("Retry-After"),
+					response.headers.get("X-RateLimit-Reset-After"),
+				]
+					.map(Number)
+					.find((value) => Number.isFinite(value) && value > 0) ?? 1;
+			const delay = Math.max(1000, Math.min(3600000, retrySeconds * 1000));
+			const global = headerGlobal || body?.global === true;
+			if (global) await this.state.storage.put("restPause", Date.now() + delay);
+			throw new RateLimited(delay, global);
 		}
 		if (!response.ok) throw new RestError(response.status);
 		return response.status === 204 ? null : response.json();
 	}
+	/** Starting before expiry durably authorizes completion, including crash/budget retries. */
+	private async startCommand(job: Job, expiresAt: number): Promise<boolean> {
+		const startedAt = await this.state.storage.transaction(async (tx) => {
+			const current = await tx.get<Job>(`job:${job.id}`);
+			if (current?.startedAt !== undefined) return current.startedAt;
+			const now = Date.now();
+			if (now >= expiresAt) return false;
+			await tx.put(`job:${job.id}`, { ...job, startedAt: now });
+			return now;
+		});
+		if (startedAt === false) return false;
+		job.startedAt = startedAt;
+		return true;
+	}
+
 	private async process(
 		job: Job,
 		env: GatewayEnv = this.env,
@@ -788,33 +827,44 @@ export class GatewayDO {
 		}
 		if (job.kind === "command") {
 			let data: MessagePayload;
-			try {
-				data = await executeInteraction(job.data, env, async (input) => {
-					const result = await this.admitBackfill({
-						...input,
-						interactionId: job.data.id,
+			const expiresAt =
+				Number(BigInt(job.data.id) >> 22n) + 1420070400000 + 14 * 60 * 1000;
+			const started = await this.startCommand(job, expiresAt);
+			if (!started) {
+				data = {
+					content:
+						"This command expired before execution. No command changes were made; submit a new interaction to try again.",
+					allowed_mentions: { parse: [] },
+				};
+				await this.failure("Unstarted command expired before execution");
+			} else
+				try {
+					data = await executeInteraction(job.data, env, async (input) => {
+						const result = await this.admitBackfill({
+							...input,
+							interactionId: job.data.id,
+						});
+						if (result !== "accepted")
+							throw new BackfillAdmissionUnavailable(result);
+						return true;
 					});
-					if (result !== "accepted")
-						throw new BackfillAdmissionUnavailable(result);
-					return true;
-				});
-			} catch (error) {
-				if (!(error instanceof BackfillAdmissionUnavailable)) throw error;
-				data = { content: error.message, allowed_mentions: { parse: [] } };
-			}
+				} catch (error) {
+					if (!(error instanceof BackfillAdmissionUnavailable)) throw error;
+					data = { content: error.message, allowed_mentions: { parse: [] } };
+				}
 			// Same job becomes its outbox atomically; crash before this write reruns the receipt-backed command.
 			job.kind = "reply";
 			job.data = {
 				applicationId: job.data.application_id,
 				token: job.data.token,
 				payload: data,
-				expiresAt:
-					Number(BigInt(job.data.id) >> 22n) + 1420070400000 + 14 * 60 * 1000,
+				expiresAt,
+				delivery: !started ? "expired" : undefined,
 			};
-			return false;
+			return !started;
 		}
 		if (job.kind === "reply") {
-			if (job.data.expiresAt < Date.now()) {
+			if (job.data.expiresAt <= Date.now()) {
 				job.data.delivery = "expired";
 				await this.failure(
 					"Reply token expired after durable command execution",
@@ -981,7 +1031,10 @@ export class GatewayDO {
 	}
 }
 class RateLimited extends Error {
-	constructor(readonly delay: number) {
+	constructor(
+		readonly delay: number,
+		readonly global: boolean,
+	) {
 		super("Discord rate limited");
 	}
 }

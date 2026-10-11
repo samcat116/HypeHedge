@@ -359,6 +359,7 @@ it("slow immediate responses finish before Discord deadline and cron only recove
 
 it("expected input errors become durable reply jobs while transient database failures propagate", async () => {
 	const bad = interaction({
+		id: (BigInt(Date.now() - 1420070400000) << 22n).toString(),
 		type: 3,
 		data: { custom_id: "market:resolve:unknown", values: ["missing"] },
 	});
@@ -374,7 +375,7 @@ it("expected input errors become durable reply jobs while transient database fai
 	)(stub, async (instance) => {
 		const job = {
 			kind: "command",
-			id: "command:12345",
+			id: `command:${bad.id}`,
 			data: bad,
 			attempts: 0,
 			due: Date.now(),
