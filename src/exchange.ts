@@ -86,16 +86,13 @@ export interface Execution {
 	participants: Party[];
 }
 
-// ID Generation using Discord Snowflake-style format
-let sequence = 0;
-const EPOCH = 1704067200000; // Jan 1, 2024
-
+// Independent isolates must not share a timestamp/sequence ID generator.
+// Keep IDs opaque decimal strings; never convert them to JavaScript numbers.
 export function generateId(): Snowflake {
-	const timestamp = Date.now() - EPOCH;
-	const seq = sequence++ % 4096;
-	// Simplified snowflake: timestamp (42 bits) + sequence (12 bits)
-	const id = (BigInt(timestamp) << 12n) | BigInt(seq);
-	return id.toString();
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	let value = 0n;
+	for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+	return value.toString();
 }
 
 /**

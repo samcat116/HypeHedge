@@ -1,17 +1,4 @@
 {
-	"compilerOptions": {
-		"target": "ES2022",
-		"module": "ESNext",
-		"moduleResolution": "Node",
-		"outDir": "dist",
-		"rootDir": "src",
-		"strict": true,
-		"esModuleInterop": true,
-		"skipLibCheck": true,
-		"forceConsistentCasingInFileNames": true,
-		"resolveJsonModule": true,
-		"declaration": true
-	},
-	"include": ["src/**/*"],
-	"exclude": ["node_modules", "dist"]
+ "compilerOptions": {"target":"ES2022", "module":"ESNext", "moduleResolution":"Bundler", "strict":true, "skipLibCheck":true, "esModuleInterop":true, "resolveJsonModule":true, "types":["@cloudflare/workers-types","@cloudflare/vitest-plugin/types"]},
+ "include":["src/cloudflare/**/*.ts","src/database.ts","src/accounting.ts","src/exchange.ts","tests/cloudflare/**/*.ts","vitest.config.ts"]
 }
